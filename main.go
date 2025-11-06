@@ -22,7 +22,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
-	defer database.Close()
+	defer func() {
+		err := database.Close()
+		if err != nil {
+			log.Printf("Error closing database: %v", err)
+		}
+	}()
 
 	// Migrate data from text file if needed
 	if err := database.MigrateFromTextFile(motivationsFile); err != nil {
@@ -44,6 +49,12 @@ func main() {
 	})
 
 	// Routes
+	e.GET("/", func(c echo.Context) error {
+		return c.String(http.StatusOK, "Welcome to the Random Motivation API!\n\n"+
+			"Endpoints:\n"+
+			"GET /motivation - Get a random motivation\n"+
+			"POST /motivation - Add a new motivation (send motivation text in request body)")
+	})
 	e.GET("/motivation", getMotivation)
 	e.POST("/motivation", postMotivation)
 
