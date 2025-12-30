@@ -4,16 +4,58 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/codegoalie/random-motivation/db"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 )
+
+// MotivationQueue holds a shuffled list of motivations and the current position
+type MotivationQueue struct {
+	motivations []string
+	currentPos  int
+	mu          sync.Mutex
+}
+
+// Next returns the next motivation in the queue, cycling back to the start when done
+func (mq *MotivationQueue) Next() (string, error) {
+	mq.mu.Lock()
+	defer mq.mu.Unlock()
+
+	if len(mq.motivations) == 0 {
+		return "", echo.NewHTTPError(http.StatusNotFound, "no motivations found")
+	}
+
+	motivation := mq.motivations[mq.currentPos]
+	mq.currentPos = (mq.currentPos + 1) % len(mq.motivations)
+
+	return motivation, nil
+}
+
+// NewMotivationQueue creates a new queue from a list of motivations and shuffles them
+func NewMotivationQueue(motivations []db.Motivation) *MotivationQueue {
+	texts := make([]string, len(motivations))
+	for i, m := range motivations {
+		texts[i] = m.Text
+	}
+
+	// Shuffle the list
+	rand.Shuffle(len(texts), func(i, j int) {
+		texts[i], texts[j] = texts[j], texts[i]
+	})
+
+	return &MotivationQueue{
+		motivations: texts,
+		currentPos:  0,
+	}
+}
 
 func main() {
 	// Initialize database
@@ -37,16 +79,21 @@ func main() {
 		log.Printf(" - [%d] %s (created at %s)", m.ID, m.Text, m.CreatedAt)
 	}
 
+	// Create and shuffle the motivation queue
+	queue := NewMotivationQueue(motivations)
+	slog.Info("Shuffled motivations queue initialized", "count", len(motivations))
+
 	e := echo.New()
 
 	// Middleware
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
 
-	// Store database in context
+	// Store database and queue in context
 	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			c.Set("db", database)
+			c.Set("queue", queue)
 			return next(c)
 		}
 	})
@@ -76,11 +123,11 @@ func main() {
 	e.Logger.Fatal(e.Start(":8080"))
 }
 
-// getMotivation returns a random motivation from the database
+// getMotivation returns the next motivation from the shuffled queue
 func getMotivation(c echo.Context) error {
-	database := c.Get("db").(*db.DB)
+	queue := c.Get("queue").(*MotivationQueue)
 
-	motivation, err := database.GetRandom()
+	motivation, err := queue.Next()
 	if err != nil {
 		if strings.Contains(err.Error(), "no motivations found") {
 			return c.String(http.StatusNotFound, "No motivations found")
