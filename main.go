@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,8 +14,6 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 )
-
-const motivationsFile = "motivations.txt"
 
 func main() {
 	// Initialize database
@@ -29,9 +28,13 @@ func main() {
 		}
 	}()
 
-	// Migrate data from text file if needed
-	if err := database.MigrateFromTextFile(motivationsFile); err != nil {
-		log.Fatalf("Failed to migrate from text file: %v", err)
+	motivations, err := database.GetAll()
+	if err != nil {
+		log.Fatalf("Failed to retrieve motivations: %v", err)
+	}
+	slog.Info("Motivations in database:", "count", len(motivations))
+	for _, m := range motivations {
+		log.Printf(" - [%d] %s (created at %s)", m.ID, m.Text, m.CreatedAt)
 	}
 
 	e := echo.New()
