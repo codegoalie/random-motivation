@@ -1,11 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -57,6 +59,14 @@ func NewMotivationQueue(motivations []db.Motivation) *MotivationQueue {
 	}
 }
 
+// GetRenderServiceURL returns the render service URL from environment or default
+func GetRenderServiceURL() string {
+	if url := os.Getenv("RENDER_SERVICE_URL"); url != "" {
+		return url
+	}
+	return "http://localhost:8081/render"
+}
+
 func main() {
 	// Initialize database
 	database, err := db.New(db.GetDBPath())
@@ -103,10 +113,12 @@ func main() {
 		return c.String(http.StatusOK, "Welcome to the Random Motivation API!\n\n"+
 			"Endpoints:\n"+
 			"GET /motivation - Get a random motivation\n"+
-			"POST /motivation - Add a new motivation (send motivation text in request body)")
+			"POST /motivation - Add a new motivation (send motivation text in request body)\n"+
+			"GET /motivations.png - Get a random motivation as an image")
 	})
 	e.GET("/motivation", getMotivation)
 	e.POST("/motivation", postMotivation)
+	e.GET("/motivations.png", getMotivationPNG)
 
 	// Graceful shutdown
 	go func() {
@@ -160,4 +172,44 @@ func postMotivation(c echo.Context) error {
 	}
 
 	return c.String(http.StatusCreated, "Motivation added successfully")
+}
+
+// getMotivationPNG returns a random motivation as a PNG image
+func getMotivationPNG(c echo.Context) error {
+	queue := c.Get("queue").(*MotivationQueue)
+
+	// Get the next motivation from the queue
+	motivation, err := queue.Next()
+	if err != nil {
+		if strings.Contains(err.Error(), "no motivations found") {
+			return c.String(http.StatusNotFound, "No motivations found")
+		}
+		return c.String(http.StatusInternalServerError, "Error retrieving motivation")
+	}
+
+	// Call the render service
+	renderServiceURL := GetRenderServiceURL()
+	renderURL := fmt.Sprintf("%s?text=%s", renderServiceURL, url.QueryEscape(motivation))
+
+	resp, err := http.Get(renderURL)
+	if err != nil {
+		slog.Error("Failed to call render service", "error", err, "url", renderURL)
+		return c.String(http.StatusInternalServerError, "Error rendering motivation image")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		slog.Error("Render service returned non-OK status", "status", resp.StatusCode, "url", renderURL)
+		return c.String(http.StatusInternalServerError, "Error rendering motivation image")
+	}
+
+	// Read the image data from the render service
+	imageData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		slog.Error("Failed to read image data from render service", "error", err)
+		return c.String(http.StatusInternalServerError, "Error reading rendered image")
+	}
+
+	// Return the image data with appropriate content type
+	return c.Blob(http.StatusOK, "image/png", imageData)
 }
