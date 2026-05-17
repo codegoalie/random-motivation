@@ -1,6 +1,7 @@
 # Random Motivation API
 
-A simple REST API that serves random motivational quotes. Built with Go, Echo framework, and SQLite.
+A simple REST API that serves random motivational quotes. Built with Go, Echo
+framework, and SQLite.
 
 ## Features
 
@@ -32,6 +33,7 @@ curl http://localhost:8080/motivation
 **Response:** A random motivational quote as plain text
 
 **Status Codes:**
+
 - `200 OK` - Success
 - `404 Not Found` - No motivations in database
 - `500 Internal Server Error` - Database error
@@ -45,6 +47,7 @@ curl -X POST -d "Your motivational quote here" http://localhost:8080/motivation
 **Response:** `Motivation added successfully`
 
 **Status Codes:**
+
 - `201 Created` - Successfully added
 - `400 Bad Request` - Empty motivation
 - `500 Internal Server Error` - Database error
@@ -56,6 +59,7 @@ Environment variables:
 - `DB_PATH` - Database file path (default: `./motivations.db`)
 
 Example:
+
 ```bash
 DB_PATH=/var/data/motivations.db ./motivation
 ```
@@ -63,6 +67,7 @@ DB_PATH=/var/data/motivations.db ./motivation
 ## Data Migration
 
 On first run, if `motivations.txt` exists, the application will:
+
 1. Migrate all quotes to the SQLite database
 2. Back up the original file as `motivations.txt.backup`
 
@@ -104,7 +109,7 @@ go fmt ./...
 
 ## Project Structure
 
-```
+```txt
 .
 ├── main.go              # HTTP server and handlers
 ├── db/                  # Database package
