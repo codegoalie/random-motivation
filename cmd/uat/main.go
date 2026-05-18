@@ -5,9 +5,11 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"time"
 )
@@ -51,12 +53,37 @@ func parseConfig(args []string, stdout, stderr io.Writer) (config, int) {
 	return cfg, exitOK
 }
 
+// run wires up an Env from cfg, executes the supplied checks, and
+// returns an appropriate exit code based on the run result.
+func run(ctx context.Context, cfg config, checks []Check, stdout, stderr io.Writer) int {
+	env := &Env{
+		BaseURL:   cfg.baseURL,
+		Client:    &http.Client{Timeout: cfg.timeout},
+		RunID:     newRunID(),
+		Verbose:   cfg.verbose,
+		RenderURL: cfg.renderURL,
+		Out:       stdout,
+		Err:       stderr,
+	}
+	res := runChecks(ctx, env, checks)
+	if res.Failed > 0 {
+		return exitBehaviorFailure
+	}
+	return exitOK
+}
+
 func main() {
 	cfg, code := parseConfig(os.Args[1:], os.Stdout, os.Stderr)
 	if code != exitOK {
 		os.Exit(code)
 	}
-	_ = cfg
-	fmt.Fprintln(os.Stdout, "UAT skeleton ready")
-	os.Exit(exitOK)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
+	defer cancel()
+	// No checks are wired yet; later beads register the actual suite.
+	checks := []Check{}
+	if len(checks) == 0 {
+		fmt.Fprintln(os.Stdout, "UAT skeleton ready")
+		os.Exit(exitOK)
+	}
+	os.Exit(run(ctx, cfg, checks, os.Stdout, os.Stderr))
 }

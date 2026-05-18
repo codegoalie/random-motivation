@@ -6,3 +6,4 @@ random-motivation
 .dolt/
 *.db
 .beads-credential-key
+/uat
