@@ -277,6 +277,104 @@ func run(ctx context.Context, cfg config, extraEnv []string, checks []Check, std
 	return exitOK
 }
 
+// checkLandingPage verifies that GET / returns 200 OK and that the
+// response body documents the public API. Tagged non-destructive: it
+// is safe to run against any reachable instance.
+func checkLandingPage() Check {
+	return Check{
+		Name: "landing page describes API",
+		Kind: nonDestructive,
+		Run: func(ctx context.Context, env *Env) error {
+			const method, path = http.MethodGet, "/"
+			resp, body, err := doRequest(ctx, env, method, path, nil)
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(method, path, resp.StatusCode, http.StatusOK); err != nil {
+				return err
+			}
+			snippets := []string{
+				"Welcome to the Random Motivation API",
+				"GET /motivation",
+				"POST /motivation",
+				"GET /motivations.png",
+			}
+			for _, s := range snippets {
+				if err := assertBodyContains(method, path, string(body), s); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+}
+
+// checkEmptyPOSTRejected verifies that POST /motivation with an empty
+// body returns 400 with the documented error message. Tagged
+// non-destructive because rejected submissions do not alter state.
+func checkEmptyPOSTRejected() Check {
+	return Check{
+		Name: "empty motivation POST is rejected",
+		Kind: nonDestructive,
+		Run: func(ctx context.Context, env *Env) error {
+			const method, path = http.MethodPost, "/motivation"
+			resp, body, err := doRequest(ctx, env, method, path, strings.NewReader(""))
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(method, path, resp.StatusCode, http.StatusBadRequest); err != nil {
+				return err
+			}
+			return assertBodyContains(method, path, string(body), "Motivation cannot be empty")
+		},
+	}
+}
+
+// checkWhitespacePOSTRejected verifies that POST /motivation with a
+// whitespace-only body is rejected after server-side trimming. Tagged
+// non-destructive.
+func checkWhitespacePOSTRejected() Check {
+	return Check{
+		Name: "whitespace motivation POST is rejected",
+		Kind: nonDestructive,
+		Run: func(ctx context.Context, env *Env) error {
+			const method, path = http.MethodPost, "/motivation"
+			resp, body, err := doRequest(ctx, env, method, path, strings.NewReader("  \n\t  "))
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(method, path, resp.StatusCode, http.StatusBadRequest); err != nil {
+				return err
+			}
+			return assertBodyContains(method, path, string(body), "Motivation cannot be empty")
+		},
+	}
+}
+
+// checkValidPOSTAccepted verifies that POST /motivation with non-empty
+// text returns 201 and the documented success message. The submitted
+// text embeds env.RunID to avoid collisions with concurrent runs.
+// Tagged destructive because it mutates server state; selection logic
+// in selection.go excludes it from existing-service mode by default.
+func checkValidPOSTAccepted() Check {
+	return Check{
+		Name: "valid motivation POST is accepted",
+		Kind: destructive,
+		Run: func(ctx context.Context, env *Env) error {
+			const method, path = http.MethodPost, "/motivation"
+			payload := fmt.Sprintf("uat valid post %s", env.RunID)
+			resp, body, err := doRequest(ctx, env, method, path, strings.NewReader(payload))
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(method, path, resp.StatusCode, http.StatusCreated); err != nil {
+				return err
+			}
+			return assertBodyContains(method, path, string(body), "Motivation added successfully")
+		},
+	}
+}
+
 func main() {
 	cfg, code := parseConfig(os.Args[1:], os.Stdout, os.Stderr)
 	if code != exitOK {

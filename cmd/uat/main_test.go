@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -584,4 +585,228 @@ func parseReportValue(content, key string) string {
 		}
 	}
 	return ""
+}
+
+// runCheckAgainst executes a Check against a temporary httptest.Server and
+// returns the resulting error. The Check is constructed via the supplied
+// factory after the server URL is known, so checks can capture env.RunID
+// at construction time if desired.
+func runCheckAgainst(t *testing.T, handler http.Handler, build func() Check) error {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	c := build()
+	return c.Run(context.Background(), env)
+}
+
+func TestCheckLandingPage_PassesWhenAllSnippetsPresent(t *testing.T) {
+	body := "Welcome to the Random Motivation API\nGET /motivation\nPOST /motivation\nGET /motivations.png\n"
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, body)
+	})
+	if err := runCheckAgainst(t, h, checkLandingPage); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestCheckLandingPage_TaggedNonDestructive(t *testing.T) {
+	c := checkLandingPage()
+	if c.Kind&nonDestructive == 0 {
+		t.Errorf("landing page check should be tagged nonDestructive")
+	}
+	if c.Kind&destructive != 0 {
+		t.Errorf("landing page check must not be tagged destructive")
+	}
+}
+
+func TestCheckLandingPage_FailsWhenStatusNotOK(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	err := runCheckAgainst(t, h, checkLandingPage)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "/", "500"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
+func TestCheckLandingPage_FailsWhenMissingSnippet(t *testing.T) {
+	// Missing "GET /motivations.png".
+	body := "Welcome to the Random Motivation API\nGET /motivation\nPOST /motivation\n"
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, body)
+	})
+	err := runCheckAgainst(t, h, checkLandingPage)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "/", "motivations.png"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
+func TestCheckEmptyPOSTRejected_PassesWhen400AndExpectedBody(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/motivation" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		b, _ := io.ReadAll(r.Body)
+		if len(b) != 0 {
+			t.Errorf("expected empty body, got %q", b)
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "Motivation cannot be empty")
+	})
+	if err := runCheckAgainst(t, h, checkEmptyPOSTRejected); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestCheckEmptyPOSTRejected_TaggedNonDestructive(t *testing.T) {
+	c := checkEmptyPOSTRejected()
+	if c.Kind&nonDestructive == 0 || c.Kind&destructive != 0 {
+		t.Errorf("empty POST check should be tagged nonDestructive only, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckEmptyPOSTRejected_FailsWhen201(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, "Motivation added successfully")
+	})
+	err := runCheckAgainst(t, h, checkEmptyPOSTRejected)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "400") {
+		t.Errorf("expected status mismatch detail, got: %s", err)
+	}
+}
+
+func TestCheckEmptyPOSTRejected_FailsOnWrongMessage(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "some other error")
+	})
+	err := runCheckAgainst(t, h, checkEmptyPOSTRejected)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "Motivation cannot be empty") {
+		t.Errorf("expected expected-message reference, got: %s", err)
+	}
+}
+
+func TestCheckWhitespacePOSTRejected_PassesWhen400AndExpectedBody(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/motivation" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		b, _ := io.ReadAll(r.Body)
+		s := string(b)
+		if len(s) == 0 || strings.TrimSpace(s) != "" {
+			t.Errorf("expected whitespace-only body, got %q", s)
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "Motivation cannot be empty")
+	})
+	if err := runCheckAgainst(t, h, checkWhitespacePOSTRejected); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestCheckWhitespacePOSTRejected_TaggedNonDestructive(t *testing.T) {
+	c := checkWhitespacePOSTRejected()
+	if c.Kind&nonDestructive == 0 || c.Kind&destructive != 0 {
+		t.Errorf("whitespace POST check should be tagged nonDestructive only, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckWhitespacePOSTRejected_FailsOnWrongStatus(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, "Motivation added successfully")
+	})
+	err := runCheckAgainst(t, h, checkWhitespacePOSTRejected)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "400") {
+		t.Errorf("expected status detail, got: %s", err)
+	}
+}
+
+func TestCheckValidPOSTAccepted_PassesWhen201AndSuccessMessage(t *testing.T) {
+	var receivedBody string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/motivation" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		b, _ := io.ReadAll(r.Body)
+		receivedBody = string(b)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, "Motivation added successfully")
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-xyz"
+	c := checkValidPOSTAccepted()
+	if err := c.Run(context.Background(), env); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if receivedBody == "" {
+		t.Fatal("expected non-empty body to be sent")
+	}
+	if !strings.Contains(receivedBody, env.RunID) {
+		t.Errorf("expected body %q to contain run ID %q", receivedBody, env.RunID)
+	}
+}
+
+func TestCheckValidPOSTAccepted_TaggedDestructive(t *testing.T) {
+	c := checkValidPOSTAccepted()
+	if c.Kind&destructive == 0 {
+		t.Errorf("valid POST check should be tagged destructive, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckValidPOSTAccepted_FailsOnWrongStatus(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	err := runCheckAgainst(t, h, checkValidPOSTAccepted)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "201") {
+		t.Errorf("expected status detail, got: %s", err)
+	}
+}
+
+func TestCheckValidPOSTAccepted_FailsOnWrongMessage(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, "something else")
+	})
+	err := runCheckAgainst(t, h, checkValidPOSTAccepted)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "Motivation added successfully") {
+		t.Errorf("expected expected-message reference, got: %s", err)
+	}
 }
