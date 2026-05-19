@@ -375,6 +375,111 @@ func checkValidPOSTAccepted() Check {
 	}
 }
 
+// retrievableExistingDefaultAttempts is the maximum number of GET
+// /motivation attempts checkSubmittedMotivationRetrievableExisting
+// makes while waiting for its submitted text to appear. The default
+// matches the UAT specification's "bounded number of GET attempts".
+const retrievableExistingDefaultAttempts = 20
+
+// retrievableExistingDefaultSleep is the pause between consecutive
+// GET attempts in checkSubmittedMotivationRetrievableExisting. It is
+// short enough to keep the total wait bounded but long enough to
+// avoid hammering a real service.
+const retrievableExistingDefaultSleep = 100 * time.Millisecond
+
+// checkSubmittedMotivationRetrievableIsolated submits a unique
+// motivation via POST /motivation, then verifies GET /motivation
+// returns 200 with a body equal to the submitted text. Tagged
+// destructive because it assumes an empty/single-entry isolated
+// database in which GET is deterministic; selection logic in
+// selection.go excludes it from existing-service mode.
+func checkSubmittedMotivationRetrievableIsolated() Check {
+	return Check{
+		Name: "submitted motivation is retrievable (isolated)",
+		Kind: destructive,
+		Run: func(ctx context.Context, env *Env) error {
+			const postMethod, postPath = http.MethodPost, "/motivation"
+			payload := "uat-retrievable-isolated-" + env.RunID
+			postResp, _, err := doRequest(ctx, env, postMethod, postPath, strings.NewReader(payload))
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(postMethod, postPath, postResp.StatusCode, http.StatusCreated); err != nil {
+				return err
+			}
+
+			const getMethod, getPath = http.MethodGet, "/motivation"
+			getResp, getBody, err := doRequest(ctx, env, getMethod, getPath, nil)
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(getMethod, getPath, getResp.StatusCode, http.StatusOK); err != nil {
+				return err
+			}
+			return assertBodyEquals(getMethod, getPath, string(getBody), payload)
+		},
+	}
+}
+
+// checkSubmittedMotivationRetrievableExisting submits a unique
+// motivation via POST /motivation, then polls GET /motivation up to
+// retrievableExistingDefaultAttempts times (sleeping
+// retrievableExistingDefaultSleep between attempts) until the response
+// body equals the submitted text. Tagged nonDestructive: the check
+// does add a motivation to the remote database, but the UAT
+// specification wants it eligible against existing services so
+// operators opt into that single mutation by including the check.
+func checkSubmittedMotivationRetrievableExisting() Check {
+	return Check{
+		Name: "submitted motivation is eventually retrievable (existing service)",
+		Kind: nonDestructive,
+		Run: func(ctx context.Context, env *Env) error {
+			return runRetrievableExisting(ctx, env,
+				retrievableExistingDefaultAttempts,
+				retrievableExistingDefaultSleep)
+		},
+	}
+}
+
+// runRetrievableExisting implements the body of
+// checkSubmittedMotivationRetrievableExisting with a configurable
+// attempt budget and sleep so tests can exercise the failure path
+// without waiting for the production-tuned defaults.
+func runRetrievableExisting(ctx context.Context, env *Env, attempts int, sleep time.Duration) error {
+	const postMethod, postPath = http.MethodPost, "/motivation"
+	payload := "uat-retrievable-existing-" + env.RunID
+	postResp, _, err := doRequest(ctx, env, postMethod, postPath, strings.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	if err := assertStatus(postMethod, postPath, postResp.StatusCode, http.StatusCreated); err != nil {
+		return err
+	}
+
+	const getMethod, getPath = http.MethodGet, "/motivation"
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(sleep):
+			}
+		}
+		getResp, getBody, err := doRequest(ctx, env, getMethod, getPath, nil)
+		if err != nil {
+			return err
+		}
+		if err := assertStatus(getMethod, getPath, getResp.StatusCode, http.StatusOK); err != nil {
+			return err
+		}
+		if string(getBody) == payload {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s %s: submitted motivation %q not observed after %d attempts",
+		getMethod, getPath, payload, attempts)
+}
+
 // checkEmptyMotivationCollection verifies that GET /motivation on a
 // service with no stored motivations returns 404 Not Found with the
 // documented "No motivations found" body. Tagged destructive because it

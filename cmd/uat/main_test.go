@@ -1382,3 +1382,166 @@ func TestCheckPNGRenderSuccess_FailsOnWrongBytes(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckSubmittedMotivationRetrievableIsolated_PassesWhenGETReturnsSubmittedText(t *testing.T) {
+	var stashed string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			stashed = string(b)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, stashed)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-iso"
+	c := checkSubmittedMotivationRetrievableIsolated()
+	if err := c.Run(context.Background(), env); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	want := "uat-retrievable-isolated-" + env.RunID
+	if stashed != want {
+		t.Errorf("emulated app stashed %q, want %q", stashed, want)
+	}
+}
+
+func TestCheckSubmittedMotivationRetrievableIsolated_TaggedDestructive(t *testing.T) {
+	c := checkSubmittedMotivationRetrievableIsolated()
+	if c.Kind&destructive == 0 {
+		t.Errorf("retrievable isolated check should be tagged destructive, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckSubmittedMotivationRetrievableIsolated_FailsOnWrongGETBody(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "some other motivation")
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkSubmittedMotivationRetrievableIsolated)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "/motivation", "some other motivation"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
+func TestCheckSubmittedMotivationRetrievableIsolated_FailsOnWrongPOSTStatus(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/motivation" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+	})
+	err := runCheckAgainst(t, h, checkSubmittedMotivationRetrievableIsolated)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"POST", "/motivation", "201", "500"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
+func TestCheckSubmittedMotivationRetrievableExisting_PassesWhenSubmittedTextAppears(t *testing.T) {
+	var stashed string
+	var gets atomic.Int32
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			stashed = string(b)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			n := gets.Add(1)
+			w.WriteHeader(http.StatusOK)
+			if n >= 3 {
+				_, _ = io.WriteString(w, stashed)
+				return
+			}
+			_, _ = io.WriteString(w, "another motivation")
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-existing"
+	// Use the parameterized helper with a short sleep to keep the test fast.
+	if err := runRetrievableExisting(context.Background(), env, 5, time.Millisecond); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	want := "uat-retrievable-existing-" + env.RunID
+	if stashed != want {
+		t.Errorf("emulated app stashed %q, want %q", stashed, want)
+	}
+	if got := gets.Load(); got < 3 {
+		t.Errorf("expected at least 3 GET attempts, got %d", got)
+	}
+}
+
+func TestCheckSubmittedMotivationRetrievableExisting_TaggedNonDestructive(t *testing.T) {
+	c := checkSubmittedMotivationRetrievableExisting()
+	if c.Kind&nonDestructive == 0 || c.Kind&destructive != 0 {
+		t.Errorf("retrievable existing check should be tagged nonDestructive only, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckSubmittedMotivationRetrievableExisting_FailsWhenSubmittedTextNeverAppears(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "never the submitted text")
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-existing-fail"
+	err := runRetrievableExisting(context.Background(), env, 3, time.Millisecond)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	want := "uat-retrievable-existing-" + env.RunID
+	for _, sub := range []string{"GET", "/motivation", want, "3 attempts"} {
+		if !strings.Contains(msg, sub) {
+			t.Errorf("expected error to mention %q, got: %s", sub, msg)
+		}
+	}
+}
