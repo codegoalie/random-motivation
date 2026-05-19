@@ -5,13 +5,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -84,21 +89,177 @@ func waitReady(ctx context.Context, client *http.Client, baseURL string) error {
 	}
 }
 
+// supervisor manages a self-managed service subprocess for a UAT run.
+// It owns the temporary working directory, the spawned process group,
+// and ensures cleanup happens exactly once even if Stop is called
+// multiple times.
+type supervisor struct {
+	cmd         *exec.Cmd
+	tempDir     string
+	dbPath      string
+	waitDone    chan error
+	logBuf      *bytes.Buffer
+	stopOnce    sync.Once
+	stopTimeout time.Duration
+}
+
+// defaultStopTimeout is how long the supervisor waits for the
+// subprocess to exit cleanly after SIGTERM before escalating to
+// SIGKILL.
+const defaultStopTimeout = 3 * time.Second
+
+// DBPath returns the absolute path to the isolated DB file the
+// subprocess was told to use via DB_PATH.
+func (s *supervisor) DBPath() string { return s.dbPath }
+
+// TempDir returns the temporary directory created for this run.
+func (s *supervisor) TempDir() string { return s.tempDir }
+
+// Logs returns whatever the subprocess wrote to stdout/stderr so far.
+// Useful for surfacing context on startup or readiness failures.
+func (s *supervisor) Logs() string {
+	if s.logBuf == nil {
+		return ""
+	}
+	return s.logBuf.String()
+}
+
+// startSelfManaged spawns the service subprocess for self-managed mode,
+// waits for HTTP readiness on cfg.baseURL, and returns a supervisor
+// that the caller MUST Stop. cfg.startCommand is deliberately invoked
+// through the system shell ("sh -c") because it is a user-provided
+// command string that often relies on shell features (pipes, env
+// substitution, e.g. `go run .`). extraEnv supplies additional
+// child environment variables on top of the parent env and the
+// auto-injected DB_PATH (e.g., RENDER_SERVICE_URL for check groups
+// that need to point the service at a controlled render endpoint).
+//
+// On any failure (start error or readiness timeout), the subprocess
+// is terminated and the temp directory is removed before returning.
+func startSelfManaged(ctx context.Context, cfg config, extraEnv []string, client *http.Client, stdout, stderr io.Writer) (*supervisor, error) {
+	if strings.TrimSpace(cfg.startCommand) == "" {
+		return nil, fmt.Errorf("startSelfManaged: empty --start-command")
+	}
+	tempDir, err := os.MkdirTemp("", "uat-")
+	if err != nil {
+		return nil, fmt.Errorf("create temp dir: %w", err)
+	}
+	dbPath := filepath.Join(tempDir, "uat-motivations.db")
+
+	// Deliberate shell invocation: --start-command is user-provided.
+	cmd := exec.CommandContext(ctx, "sh", "-c", cfg.startCommand)
+	env := append(os.Environ(), "DB_PATH="+dbPath)
+	if len(extraEnv) > 0 {
+		env = append(env, extraEnv...)
+	}
+	cmd.Env = env
+
+	logBuf := &bytes.Buffer{}
+	if cfg.verbose {
+		cmd.Stdout = io.MultiWriter(stdout, logBuf)
+		cmd.Stderr = io.MultiWriter(stderr, logBuf)
+	} else {
+		cmd.Stdout = logBuf
+		cmd.Stderr = logBuf
+	}
+	// Run subprocess (and any children it spawns, e.g. `go run .`) in
+	// their own process group so we can signal the whole tree on
+	// shutdown rather than only the shell wrapper.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Start(); err != nil {
+		_ = os.RemoveAll(tempDir)
+		return nil, fmt.Errorf("start service subprocess (%q): %w", cfg.startCommand, err)
+	}
+
+	sup := &supervisor{
+		cmd:         cmd,
+		tempDir:     tempDir,
+		dbPath:      dbPath,
+		waitDone:    make(chan error, 1),
+		logBuf:      logBuf,
+		stopTimeout: defaultStopTimeout,
+	}
+	go func() { sup.waitDone <- cmd.Wait() }()
+
+	if err := waitReady(ctx, client, cfg.baseURL); err != nil {
+		sup.Stop()
+		return nil, fmt.Errorf("service readiness on %s: %w\nsubprocess logs:\n%s",
+			cfg.baseURL, err, logBuf.String())
+	}
+	return sup, nil
+}
+
+// Stop terminates the subprocess (SIGTERM, then SIGKILL after
+// stopTimeout) and removes the temp directory. It is safe to call
+// multiple times; only the first call has effect.
+func (s *supervisor) Stop() {
+	if s == nil {
+		return
+	}
+	s.stopOnce.Do(s.stop)
+}
+
+func (s *supervisor) stop() {
+	if s.cmd != nil && s.cmd.Process != nil {
+		// Signal the whole process group on POSIX: passing a negative
+		// PID to kill(2) targets every process in the group, so children
+		// spawned by `sh -c` also receive the signal.
+		target := -s.cmd.Process.Pid
+		if pgid, err := syscall.Getpgid(s.cmd.Process.Pid); err == nil {
+			target = -pgid
+		}
+		_ = syscall.Kill(target, syscall.SIGTERM)
+		timeout := s.stopTimeout
+		if timeout <= 0 {
+			timeout = defaultStopTimeout
+		}
+		select {
+		case <-s.waitDone:
+		case <-time.After(timeout):
+			_ = syscall.Kill(target, syscall.SIGKILL)
+			<-s.waitDone
+		}
+	}
+	if s.tempDir != "" {
+		_ = os.RemoveAll(s.tempDir)
+	}
+}
+
 // run wires up an Env from cfg, executes the supplied checks, and
 // returns an appropriate exit code based on the run result.
 //
 // When cfg.startCommand is empty, run operates in existing-service
 // mode: it polls the base URL for readiness over HTTP before running
 // the suite, and does not create temp directories, set DB_PATH, or
-// start subprocesses. A readiness timeout is treated as a behavioral
-// failure (exitBehaviorFailure), not a usage error.
-func run(ctx context.Context, cfg config, checks []Check, stdout, stderr io.Writer) int {
+// start subprocesses.
+//
+// When cfg.startCommand is non-empty, run operates in self-managed
+// mode: it creates a temp dir, sets DB_PATH (plus any extraEnv such as
+// RENDER_SERVICE_URL) for the child, launches the subprocess via
+// `sh -c`, waits for readiness, runs the checks, and tears down the
+// subprocess and temp dir on exit (success, failure, panic, or
+// context timeout).
+//
+// extraEnv lets callers (typically check groups in main()) inject
+// additional child env vars before startup. Checks needing different
+// render behavior require separate self-managed runs/groups because a
+// supervisor builds one env map before start.
+func run(ctx context.Context, cfg config, extraEnv []string, checks []Check, stdout, stderr io.Writer) int {
 	client := &http.Client{Timeout: cfg.timeout}
 	if cfg.startCommand == "" {
 		if err := waitReady(ctx, client, cfg.baseURL); err != nil {
 			fmt.Fprintf(stderr, "readiness check failed: %v\n", err)
 			return exitBehaviorFailure
 		}
+	} else {
+		sup, err := startSelfManaged(ctx, cfg, extraEnv, client, stdout, stderr)
+		if err != nil {
+			fmt.Fprintf(stderr, "self-managed startup failed: %v\n", err)
+			return exitBehaviorFailure
+		}
+		// Cleanup runs on success, failure, context timeout, and panic.
+		defer sup.Stop()
 	}
 	env := &Env{
 		BaseURL:   cfg.baseURL,
@@ -129,5 +290,12 @@ func main() {
 		fmt.Fprintln(os.Stdout, "UAT skeleton ready")
 		os.Exit(exitOK)
 	}
-	os.Exit(run(ctx, cfg, checks, os.Stdout, os.Stderr))
+	// Default extraEnv for self-managed mode: propagate --render-url
+	// into the child as RENDER_SERVICE_URL so the spawned service
+	// points at the same render endpoint the suite asserts against.
+	var extraEnv []string
+	if cfg.renderURL != "" {
+		extraEnv = append(extraEnv, "RENDER_SERVICE_URL="+cfg.renderURL)
+	}
+	os.Exit(run(ctx, cfg, extraEnv, checks, os.Stdout, os.Stderr))
 }
