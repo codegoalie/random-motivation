@@ -45,6 +45,21 @@ go test ./...          # Run all tests
 go test -v ./...       # Run tests with verbose output
 ```
 
+### UAT (User Acceptance Testing)
+The repository ships a black-box UAT suite under `cmd/uat` that interacts only
+via the public HTTP API and process-level controls (no app imports, no direct
+DB access).
+```bash
+# Against an already-running service (read-only + eventual-retrieval checks)
+go run ./cmd/uat --base-url http://localhost:8080
+
+# Self-managed isolated mode with fresh DB and fake render service
+go run ./cmd/uat --start-command "go run ." --base-url http://localhost:8080 --timeout 30s
+
+# Useful flags: --timeout, --verbose, --skip-destructive, --render-url
+```
+Exit codes: `0` all checks passed, `1` behavioral failures, `2` invalid CLI usage.
+
 ### Database Operations
 ```bash
 # View database content
@@ -64,6 +79,8 @@ sqlite3 motivations.db "SELECT COUNT(*) FROM motivations;"
 │   ├── migrations.go          # Schema creation
 │   ├── repository.go          # Data access methods (CRUD operations)
 │   └── migrate_text.go        # Text file to SQLite migration
+├── cmd/
+│   └── uat/                   # Black-box UAT suite (see Development > UAT)
 ├── go.mod                     # Go module definition (Go 1.25.3)
 ├── motivations.db             # SQLite database (generated at runtime)
 ├── motivations.txt.backup     # Backup of original text file
