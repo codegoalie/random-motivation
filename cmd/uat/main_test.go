@@ -811,6 +811,60 @@ func TestCheckValidPOSTAccepted_FailsOnWrongMessage(t *testing.T) {
 	}
 }
 
+func TestCheckEmptyMotivationCollection_PassesWhen404AndExpectedBody(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/motivation" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, "No motivations found")
+	})
+	if err := runCheckAgainst(t, h, checkEmptyMotivationCollection); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestCheckEmptyMotivationCollection_TaggedDestructive(t *testing.T) {
+	c := checkEmptyMotivationCollection()
+	if c.Kind&destructive == 0 {
+		t.Errorf("empty motivation collection check should be tagged destructive, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckEmptyMotivationCollection_FailsWhen200(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "Some motivation")
+	})
+	err := runCheckAgainst(t, h, checkEmptyMotivationCollection)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "/motivation", "404", "200"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
+func TestCheckEmptyMotivationCollection_FailsOnWrongBody(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, "not the expected body")
+	})
+	err := runCheckAgainst(t, h, checkEmptyMotivationCollection)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "/motivation", "No motivations found"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
 func TestCheckUnsupportedMethods_PassesWhenAll405(t *testing.T) {
 	type seenKey struct{ method, path string }
 	seen := map[seenKey]bool{}
