@@ -375,6 +375,58 @@ func checkValidPOSTAccepted() Check {
 	}
 }
 
+// checkUnsupportedMethods verifies that the service rejects HTTP
+// methods that are not part of the documented API with 405 Method Not
+// Allowed. It exercises PUT /motivation, DELETE /motivation, and
+// POST /motivations.png. Tagged non-destructive: rejected requests do
+// not mutate state. The response body is not asserted because
+// framework-generated 405 bodies vary.
+func checkUnsupportedMethods() Check {
+	return Check{
+		Name: "unsupported methods are rejected with 405",
+		Kind: nonDestructive,
+		Run: func(ctx context.Context, env *Env) error {
+			cases := []struct {
+				method, path string
+			}{
+				{http.MethodPut, "/motivation"},
+				{http.MethodDelete, "/motivation"},
+				{http.MethodPost, "/motivations.png"},
+			}
+			for _, c := range cases {
+				resp, _, err := doRequest(ctx, env, c.method, c.path, nil)
+				if err != nil {
+					return err
+				}
+				if err := assertStatus(c.method, c.path, resp.StatusCode, http.StatusMethodNotAllowed); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+}
+
+// checkUnknownRoute verifies that requesting an undefined path returns
+// 404 Not Found. The path embeds env.RunID to avoid collisions with
+// any future endpoints. Tagged non-destructive. Only the status code is
+// asserted because the response body is framework-specific.
+func checkUnknownRoute() Check {
+	return Check{
+		Name: "unknown route returns 404",
+		Kind: nonDestructive,
+		Run: func(ctx context.Context, env *Env) error {
+			const method = http.MethodGet
+			path := "/uat-route-that-should-not-exist-" + env.RunID
+			resp, _, err := doRequest(ctx, env, method, path, nil)
+			if err != nil {
+				return err
+			}
+			return assertStatus(method, path, resp.StatusCode, http.StatusNotFound)
+		},
+	}
+}
+
 func main() {
 	cfg, code := parseConfig(os.Args[1:], os.Stdout, os.Stderr)
 	if code != exitOK {

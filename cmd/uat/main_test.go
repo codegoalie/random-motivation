@@ -810,3 +810,120 @@ func TestCheckValidPOSTAccepted_FailsOnWrongMessage(t *testing.T) {
 		t.Errorf("expected expected-message reference, got: %s", err)
 	}
 }
+
+func TestCheckUnsupportedMethods_PassesWhenAll405(t *testing.T) {
+	type seenKey struct{ method, path string }
+	seen := map[seenKey]bool{}
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen[seenKey{r.Method, r.URL.Path}] = true
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
+	if err := runCheckAgainst(t, h, checkUnsupportedMethods); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	want := []seenKey{
+		{http.MethodPut, "/motivation"},
+		{http.MethodDelete, "/motivation"},
+		{http.MethodPost, "/motivations.png"},
+	}
+	for _, k := range want {
+		if !seen[k] {
+			t.Errorf("expected check to send %s %s", k.method, k.path)
+		}
+	}
+}
+
+func TestCheckUnsupportedMethods_TaggedNonDestructive(t *testing.T) {
+	c := checkUnsupportedMethods()
+	if c.Kind&nonDestructive == 0 || c.Kind&destructive != 0 {
+		t.Errorf("unsupported methods check should be tagged nonDestructive only, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckUnsupportedMethods_FailsIdentifiesMethodAndPath(t *testing.T) {
+	// PUT /motivation returns 200 instead of 405 -> error must mention it.
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.URL.Path == "/motivation" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
+	err := runCheckAgainst(t, h, checkUnsupportedMethods)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"PUT", "/motivation", "405", "200"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
+func TestCheckUnsupportedMethods_FailsIdentifiesPOSTPng(t *testing.T) {
+	// POST /motivations.png returns 201 instead of 405.
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/motivations.png" {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
+	err := runCheckAgainst(t, h, checkUnsupportedMethods)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"POST", "/motivations.png", "405"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
+func TestCheckUnknownRoute_PassesWhen404AndPathHasRunID(t *testing.T) {
+	var observedPath, observedMethod string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observedMethod = r.Method
+		observedPath = r.URL.Path
+		w.WriteHeader(http.StatusNotFound)
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-abc123"
+	c := checkUnknownRoute()
+	if err := c.Run(context.Background(), env); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if observedMethod != http.MethodGet {
+		t.Errorf("expected GET, got %s", observedMethod)
+	}
+	if !strings.Contains(observedPath, env.RunID) {
+		t.Errorf("expected path %q to include run ID %q", observedPath, env.RunID)
+	}
+}
+
+func TestCheckUnknownRoute_TaggedNonDestructive(t *testing.T) {
+	c := checkUnknownRoute()
+	if c.Kind&nonDestructive == 0 || c.Kind&destructive != 0 {
+		t.Errorf("unknown route check should be tagged nonDestructive only, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckUnknownRoute_FailsWhen200(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	err := runCheckAgainst(t, h, checkUnknownRoute)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "404", "200"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
