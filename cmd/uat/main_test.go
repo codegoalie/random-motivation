@@ -1261,6 +1261,98 @@ func TestCheckRenderServiceUnreachable_FailsOnWrongBody(t *testing.T) {
 	}
 }
 
+func TestCheckRenderServiceNonOK_PassesWhen500AndExpectedBody(t *testing.T) {
+	var stashed string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			stashed = strings.TrimSpace(string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations.png":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, "Error rendering motivation image")
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-nonok"
+	c := checkRenderServiceNonOK()
+	if err := c.Run(context.Background(), env); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	want := "uat-render-nonok-" + env.RunID
+	if stashed != want {
+		t.Errorf("emulated app stashed %q, want %q", stashed, want)
+	}
+}
+
+func TestCheckRenderServiceNonOK_TaggedDestructiveAndRenderRequired(t *testing.T) {
+	c := checkRenderServiceNonOK()
+	if c.Kind&destructive == 0 {
+		t.Errorf("render-non-OK check should be tagged destructive, got kind=%d", c.Kind)
+	}
+	if c.Kind&renderRequired == 0 {
+		t.Errorf("render-non-OK check should be tagged renderRequired, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckRenderServiceNonOK_FailsOnWrongPNGStatus(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations.png":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "Error rendering motivation image")
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkRenderServiceNonOK)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "/motivations.png", "500", "200"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
+func TestCheckRenderServiceNonOK_FailsOnWrongBody(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations.png":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, "something else")
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkRenderServiceNonOK)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "/motivations.png", "Error rendering motivation image"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
 func TestCheckPNGRenderSuccess_FailsOnWrongBytes(t *testing.T) {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {

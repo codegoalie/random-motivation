@@ -505,6 +505,44 @@ func checkRenderServiceUnreachable() Check {
 	}
 }
 
+// checkRenderServiceNonOK submits a unique motivation via
+// POST /motivation, then verifies GET /motivations.png returns 500
+// with the documented "Error rendering motivation image" body when the
+// service's configured render endpoint returns a non-200 response.
+// Tagged destructive | renderRequired: it mutates server state and
+// assumes the runner/supervisor has pointed the service at a render
+// endpoint that returns a non-OK status (T22's responsibility). From
+// the API/client perspective this is indistinguishable from the
+// unreachable case (T20); the difference lies in how the render
+// service is supervised.
+func checkRenderServiceNonOK() Check {
+	return Check{
+		Name: "PNG render fails when render service returns non-OK",
+		Kind: destructive | renderRequired,
+		Run: func(ctx context.Context, env *Env) error {
+			const postMethod, postPath = http.MethodPost, "/motivation"
+			payload := "uat-render-nonok-" + env.RunID
+			postResp, _, err := doRequest(ctx, env, postMethod, postPath, strings.NewReader(payload))
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(postMethod, postPath, postResp.StatusCode, http.StatusCreated); err != nil {
+				return err
+			}
+
+			const getMethod, getPath = http.MethodGet, "/motivations.png"
+			getResp, getBody, err := doRequest(ctx, env, getMethod, getPath, nil)
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(getMethod, getPath, getResp.StatusCode, http.StatusInternalServerError); err != nil {
+				return err
+			}
+			return assertBodyContains(getMethod, getPath, string(getBody), "Error rendering motivation image")
+		},
+	}
+}
+
 // checkUnsupportedMethods verifies that the service rejects HTTP
 // methods that are not part of the documented API with 405 Method Not
 // Allowed. It exercises PUT /motivation, DELETE /motivation, and
