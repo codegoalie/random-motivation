@@ -2,7 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -103,5 +107,119 @@ func TestParseConfig_HelpListsAllFlags(t *testing.T) {
 		if !strings.Contains(usage, flag) {
 			t.Errorf("usage output missing flag %q; got: %s", flag, usage)
 		}
+	}
+}
+
+func TestWaitReady_ImmediateSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	if err := waitReady(ctx, srv.Client(), srv.URL); err != nil {
+		t.Fatalf("waitReady returned error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("waitReady took too long for immediate success: %v", elapsed)
+	}
+}
+
+func TestWaitReady_EventualSuccess(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		if n < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := waitReady(ctx, srv.Client(), srv.URL); err != nil {
+		t.Fatalf("waitReady returned error: %v", err)
+	}
+	if got := attempts.Load(); got < 3 {
+		t.Errorf("expected at least 3 attempts, got %d", got)
+	}
+}
+
+func TestWaitReady_ContextTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := waitReady(ctx, srv.Client(), srv.URL)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("waitReady should have errored on timeout")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("waitReady took too long to return after timeout: %v", elapsed)
+	}
+}
+
+func TestRun_ExistingServiceModeNoSubprocess(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := config{
+		baseURL:      srv.URL,
+		startCommand: "",
+		timeout:      2 * time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	code := run(ctx, cfg, []Check{}, &stdout, &stderr)
+	if code != exitOK {
+		t.Fatalf("run returned %d, stderr=%q", code, stderr.String())
+	}
+	if attempts.Load() < 1 {
+		t.Errorf("expected readiness probe against base URL, got 0 attempts")
+	}
+	// Existing-service mode must not create temp dirs, set DB_PATH, or spawn subprocesses.
+	if v := stderr.String(); strings.Contains(v, "subprocess") || strings.Contains(v, "DB_PATH") {
+		t.Errorf("existing-service mode leaked subprocess/env setup: %q", v)
+	}
+}
+
+func TestRun_ExistingServiceModeReadinessTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	cfg := config{
+		baseURL:      srv.URL,
+		startCommand: "",
+		timeout:      400 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	code := run(ctx, cfg, []Check{}, &stdout, &stderr)
+	if code != exitBehaviorFailure {
+		t.Fatalf("expected exitBehaviorFailure for readiness timeout, got %d", code)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -53,12 +54,55 @@ func parseConfig(args []string, stdout, stderr io.Writer) (config, int) {
 	return cfg, exitOK
 }
 
+// waitReady polls GET / on baseURL until a 200 OK response is received
+// or the context is cancelled. It uses a short, bounded poll interval
+// and respects context cancellation between attempts.
+func waitReady(ctx context.Context, client *http.Client, baseURL string) error {
+	url := strings.TrimRight(baseURL, "/") + "/"
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return fmt.Errorf("build readiness request: %w", err)
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			if resp.StatusCode == http.StatusOK {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				return nil
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for %s readiness: %w", baseURL, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 // run wires up an Env from cfg, executes the supplied checks, and
 // returns an appropriate exit code based on the run result.
+//
+// When cfg.startCommand is empty, run operates in existing-service
+// mode: it polls the base URL for readiness over HTTP before running
+// the suite, and does not create temp directories, set DB_PATH, or
+// start subprocesses. A readiness timeout is treated as a behavioral
+// failure (exitBehaviorFailure), not a usage error.
 func run(ctx context.Context, cfg config, checks []Check, stdout, stderr io.Writer) int {
+	client := &http.Client{Timeout: cfg.timeout}
+	if cfg.startCommand == "" {
+		if err := waitReady(ctx, client, cfg.baseURL); err != nil {
+			fmt.Fprintf(stderr, "readiness check failed: %v\n", err)
+			return exitBehaviorFailure
+		}
+	}
 	env := &Env{
 		BaseURL:   cfg.baseURL,
-		Client:    &http.Client{Timeout: cfg.timeout},
+		Client:    client,
 		RunID:     newRunID(),
 		Verbose:   cfg.verbose,
 		RenderURL: cfg.renderURL,
