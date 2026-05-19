@@ -1776,3 +1776,165 @@ func TestCheckMultipleMotivationsRetrievable_FailsOnNon200GET(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckRepeatedGETAvailability_PassesWhenAllGETsReturnKnownBody(t *testing.T) {
+	var submitted []string
+	var gets atomic.Int32
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			submitted = append(submitted, string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			n := int(gets.Add(1)) - 1
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, submitted[n%len(submitted)])
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-avail"
+	c := checkRepeatedGETAvailability()
+	if err := c.Run(context.Background(), env); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if len(submitted) != repeatedGETAvailabilitySubmissions {
+		t.Errorf("expected %d POSTs, got %d (submitted=%q)",
+			repeatedGETAvailabilitySubmissions, len(submitted), submitted)
+	}
+	for i, s := range submitted {
+		want := fmt.Sprintf("uat avail %s #%d", env.RunID, i+1)
+		if s != want {
+			t.Errorf("submitted[%d]=%q, want %q", i, s, want)
+		}
+	}
+	if got := int(gets.Load()); got != repeatedGETAvailabilityAttempts {
+		t.Errorf("expected %d GET attempts, got %d",
+			repeatedGETAvailabilityAttempts, got)
+	}
+}
+
+func TestCheckRepeatedGETAvailability_TaggedDestructive(t *testing.T) {
+	c := checkRepeatedGETAvailability()
+	if c.Kind&destructive == 0 {
+		t.Errorf("repeated GET availability check should be tagged destructive, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckRepeatedGETAvailability_FailsOnNon200GET(t *testing.T) {
+	var submitted []string
+	var gets atomic.Int32
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			submitted = append(submitted, string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			n := int(gets.Add(1))
+			if n == 5 {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, "No motivations found")
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, submitted[(n-1)%len(submitted)])
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-avail-404"
+	err := runRepeatedGETAvailability(context.Background(), env, 3, 7)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, sub := range []string{"GET", "/motivation", "attempt 5", "404", "200"} {
+		if !strings.Contains(msg, sub) {
+			t.Errorf("expected error to mention %q, got: %s", sub, msg)
+		}
+	}
+}
+
+func TestCheckRepeatedGETAvailability_FailsOnUnknownGETBody(t *testing.T) {
+	var submitted []string
+	var gets atomic.Int32
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			submitted = append(submitted, string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			n := int(gets.Add(1))
+			w.WriteHeader(http.StatusOK)
+			if n == 3 {
+				_, _ = io.WriteString(w, "rogue body")
+				return
+			}
+			_, _ = io.WriteString(w, submitted[(n-1)%len(submitted)])
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-avail-rogue"
+	err := runRepeatedGETAvailability(context.Background(), env, 2, 5)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, sub := range []string{"GET", "/motivation", "attempt 3", "rogue body"} {
+		if !strings.Contains(msg, sub) {
+			t.Errorf("expected error to mention %q, got: %s", sub, msg)
+		}
+	}
+}
+
+func TestCheckRepeatedGETAvailability_FailsOnWrongPOSTStatus(t *testing.T) {
+	var posts atomic.Int32
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/motivation" {
+			n := int(posts.Add(1))
+			if n == 2 {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-avail-postfail"
+	err := runRepeatedGETAvailability(context.Background(), env, 3, 5)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, sub := range []string{"POST", "/motivation", "submission #2", "201", "500"} {
+		if !strings.Contains(msg, sub) {
+			t.Errorf("expected error to mention %q, got: %s", sub, msg)
+		}
+	}
+}

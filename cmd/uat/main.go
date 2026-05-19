@@ -609,6 +609,84 @@ func runMultipleMotivationsRetrievable(ctx context.Context, env *Env, count, max
 		getMethod, getPath, maxAttempts, missing)
 }
 
+// repeatedGETAvailabilitySubmissions is the number of unique motivations
+// checkRepeatedGETAvailability submits before exercising repeated reads.
+const repeatedGETAvailabilitySubmissions = 3
+
+// repeatedGETAvailabilityAttempts is the number of GET /motivation calls
+// checkRepeatedGETAvailability issues after submission. Per UAT.md
+// ("Motivation retrieval remains available after repeated reads"), this
+// must exceed the number of submitted motivations; 7 is one more than
+// twice the submitted count, ensuring the service services more reads
+// than there are entries.
+const repeatedGETAvailabilityAttempts = 7
+
+// checkRepeatedGETAvailability submits three unique motivations via
+// POST /motivation, then issues seven GET /motivation calls and asserts
+// every response is 200 OK with a body matching one of the submitted
+// texts. Unlike checkMultipleMotivationsRetrievable, it does not
+// require every submission to be observed; it only verifies that
+// retrieval remains available across more reads than there are
+// entries (no 404, no unexpected bodies). Tagged destructive: known-
+// value-only assertion requires an isolated database; selection logic
+// in selection.go excludes it from existing-service mode.
+func checkRepeatedGETAvailability() Check {
+	return Check{
+		Name: "repeated GET /motivation remains available (isolated)",
+		Kind: destructive,
+		Run: func(ctx context.Context, env *Env) error {
+			return runRepeatedGETAvailability(ctx, env,
+				repeatedGETAvailabilitySubmissions,
+				repeatedGETAvailabilityAttempts)
+		},
+	}
+}
+
+// runRepeatedGETAvailability implements the body of
+// checkRepeatedGETAvailability with a configurable submission count
+// and GET attempt budget so tests can exercise failure paths cheaply.
+func runRepeatedGETAvailability(ctx context.Context, env *Env, count, attempts int) error {
+	const postMethod, postPath = http.MethodPost, "/motivation"
+	submitted := make([]string, 0, count)
+	for i := 1; i <= count; i++ {
+		payload := fmt.Sprintf("uat avail %s #%d", env.RunID, i)
+		submitted = append(submitted, payload)
+		resp, _, err := doRequest(ctx, env, postMethod, postPath, strings.NewReader(payload))
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != http.StatusCreated {
+			return fmt.Errorf("%s %s: submission #%d status got=%d want=%d",
+				postMethod, postPath, i, resp.StatusCode, http.StatusCreated)
+		}
+	}
+
+	const getMethod, getPath = http.MethodGet, "/motivation"
+	for attempt := 1; attempt <= attempts; attempt++ {
+		resp, body, err := doRequest(ctx, env, getMethod, getPath, nil)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("%s %s: attempt %d status got=%d want=%d",
+				getMethod, getPath, attempt, resp.StatusCode, http.StatusOK)
+		}
+		got := string(body)
+		known := false
+		for _, s := range submitted {
+			if s == got {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return fmt.Errorf("%s %s: attempt %d returned unexpected body %q; expected one of %q",
+				getMethod, getPath, attempt, got, submitted)
+		}
+	}
+	return nil
+}
+
 // checkEmptyMotivationCollection verifies that GET /motivation on a
 // service with no stored motivations returns 404 Not Found with the
 // documented "No motivations found" body. Tagged destructive because it
