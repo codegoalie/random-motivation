@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -1030,6 +1031,168 @@ func TestCheckUnknownRoute_FailsWhen200(t *testing.T) {
 	}
 	msg := err.Error()
 	for _, want := range []string{"GET", "404", "200"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
+// pngRenderSuccessHandler builds the app-emulation handler used by
+// checkPNGRenderSuccess unit tests. POST /motivation stashes the body
+// (trimmed, matching the real service) and returns 201. GET
+// /motivations.png proxies to the supplied fake render service using
+// the stashed text, then returns the render service's status,
+// Content-Type, and body to the caller.
+func pngRenderSuccessHandler(t *testing.T, fr *fakeRender, stashed *string) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			*stashed = strings.TrimSpace(string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations.png":
+			renderURL := fr.URL() + "/render?text=" + url.QueryEscape(*stashed)
+			resp, err := http.Get(renderURL)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if ct := resp.Header.Get("Content-Type"); ct != "" {
+				w.Header().Set("Content-Type", ct)
+			}
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+}
+
+func TestCheckPNGRenderSuccess_PassesAndForwardsTextToRender(t *testing.T) {
+	fr := newFakeRender()
+	defer fr.Close()
+	var stashed string
+	srv := httptest.NewServer(pngRenderSuccessHandler(t, fr, &stashed))
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-png"
+	c := checkPNGRenderSuccess()
+	if err := c.Run(context.Background(), env); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	want := "uat-render-success-" + env.RunID
+	if stashed != want {
+		t.Errorf("emulated app stashed %q, want %q", stashed, want)
+	}
+	texts := fr.Texts()
+	if len(texts) == 0 {
+		t.Fatal("expected fake render to record at least one text")
+	}
+	if got := texts[len(texts)-1]; got != want {
+		t.Errorf("fake render last recorded text = %q, want %q", got, want)
+	}
+}
+
+func TestCheckPNGRenderSuccess_TaggedDestructiveAndRenderRequired(t *testing.T) {
+	c := checkPNGRenderSuccess()
+	if c.Kind&destructive == 0 {
+		t.Errorf("PNG render success check should be tagged destructive, got kind=%d", c.Kind)
+	}
+	if c.Kind&renderRequired == 0 {
+		t.Errorf("PNG render success check should be tagged renderRequired, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckPNGRenderSuccess_FailsOnWrongPNGStatus(t *testing.T) {
+	fr := newFakeRender()
+	defer fr.Close()
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations.png":
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	c := checkPNGRenderSuccess()
+	err := c.Run(context.Background(), env)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "/motivations.png", "200", "500"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
+func TestCheckPNGRenderSuccess_FailsOnWrongContentType(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations.png":
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(png1x1)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	c := checkPNGRenderSuccess()
+	err := c.Run(context.Background(), env)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "/motivations.png", "image/png", "text/plain"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
+func TestCheckPNGRenderSuccess_FailsOnWrongBytes(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations.png":
+			w.Header().Set("Content-Type", "image/png")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("not-the-png-fixture"))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	c := checkPNGRenderSuccess()
+	err := c.Run(context.Background(), env)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "/motivations.png", "PNG fixture"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("expected error to mention %q, got: %s", want, msg)
 		}

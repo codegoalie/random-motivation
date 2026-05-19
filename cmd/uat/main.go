@@ -422,6 +422,50 @@ func checkPNGNoMotivations() Check {
 	}
 }
 
+// checkPNGRenderSuccess submits a unique motivation via POST /motivation,
+// then verifies GET /motivations.png returns 200 OK with Content-Type
+// image/png and bytes equal to the fake render service's PNG fixture.
+// Tagged destructive | renderRequired: it mutates server state and
+// assumes a controlled render endpoint (the fake render service in
+// self-managed mode, or an explicit --render-url in existing mode).
+func checkPNGRenderSuccess() Check {
+	return Check{
+		Name: "PNG render success",
+		Kind: destructive | renderRequired,
+		Run: func(ctx context.Context, env *Env) error {
+			const postMethod, postPath = http.MethodPost, "/motivation"
+			payload := "uat-render-success-" + env.RunID
+			postResp, postBody, err := doRequest(ctx, env, postMethod, postPath, strings.NewReader(payload))
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(postMethod, postPath, postResp.StatusCode, http.StatusCreated); err != nil {
+				return err
+			}
+			if err := assertBodyContains(postMethod, postPath, string(postBody), "Motivation added successfully"); err != nil {
+				return err
+			}
+
+			const getMethod, getPath = http.MethodGet, "/motivations.png"
+			getResp, getBody, err := doRequest(ctx, env, getMethod, getPath, nil)
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(getMethod, getPath, getResp.StatusCode, http.StatusOK); err != nil {
+				return err
+			}
+			if err := assertContentTypePrefix(getMethod, getPath, getResp.Header, "image/png"); err != nil {
+				return err
+			}
+			if !bytes.Equal(getBody, png1x1) {
+				return fmt.Errorf("%s %s: body bytes do not match PNG fixture (got %d bytes, want %d)",
+					getMethod, getPath, len(getBody), len(png1x1))
+			}
+			return nil
+		},
+	}
+}
+
 // checkUnsupportedMethods verifies that the service rejects HTTP
 // methods that are not part of the documented API with 405 Method Not
 // Allowed. It exercises PUT /motivation, DELETE /motivation, and
