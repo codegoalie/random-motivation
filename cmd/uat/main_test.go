@@ -1467,6 +1467,94 @@ func TestCheckSubmittedMotivationRetrievableIsolated_FailsOnWrongPOSTStatus(t *t
 	}
 }
 
+func TestCheckTrimmedSubmission_PassesWhenServerTrimsAndReturnsCore(t *testing.T) {
+	var stashed string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			stashed = strings.TrimSpace(string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, stashed)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-trim"
+	c := checkTrimmedSubmission()
+	if err := c.Run(context.Background(), env); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	want := "Stay focused " + env.RunID + "."
+	if stashed != want {
+		t.Errorf("emulated app stashed %q, want %q", stashed, want)
+	}
+}
+
+func TestCheckTrimmedSubmission_TaggedDestructive(t *testing.T) {
+	c := checkTrimmedSubmission()
+	if c.Kind&destructive == 0 {
+		t.Errorf("trimmed submission check should be tagged destructive, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckTrimmedSubmission_FailsWhenServerDoesNotTrim(t *testing.T) {
+	var stashed string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			stashed = string(b)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, stashed)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	err := runCheckAgainst(t, h, checkTrimmedSubmission)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "/motivation", "Stay focused"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
+func TestCheckTrimmedSubmission_FailsOnWrongPOSTStatus(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/motivation" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+	})
+	err := runCheckAgainst(t, h, checkTrimmedSubmission)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"POST", "/motivation", "201", "500"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
 func TestCheckSubmittedMotivationRetrievableExisting_PassesWhenSubmittedTextAppears(t *testing.T) {
 	var stashed string
 	var gets atomic.Int32

@@ -421,6 +421,44 @@ func checkSubmittedMotivationRetrievableIsolated() Check {
 	}
 }
 
+// checkTrimmedSubmission submits a motivation surrounded by leading
+// and trailing whitespace via POST /motivation, then verifies that
+// GET /motivation returns 200 with a body equal to the trimmed core
+// text (no surrounding whitespace). This proves the API strips
+// whitespace before storing/serving. Tagged destructive because
+// deterministic equality requires an empty/single-entry isolated
+// database; selection logic in selection.go excludes it from
+// existing-service mode.
+func checkTrimmedSubmission() Check {
+	return Check{
+		Name: "submitted motivation is trimmed before storage",
+		Kind: destructive,
+		Run: func(ctx context.Context, env *Env) error {
+			core := "Stay focused " + env.RunID + "."
+			submission := "   " + core + "   "
+
+			const postMethod, postPath = http.MethodPost, "/motivation"
+			postResp, _, err := doRequest(ctx, env, postMethod, postPath, strings.NewReader(submission))
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(postMethod, postPath, postResp.StatusCode, http.StatusCreated); err != nil {
+				return err
+			}
+
+			const getMethod, getPath = http.MethodGet, "/motivation"
+			getResp, getBody, err := doRequest(ctx, env, getMethod, getPath, nil)
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(getMethod, getPath, getResp.StatusCode, http.StatusOK); err != nil {
+				return err
+			}
+			return assertBodyEquals(getMethod, getPath, string(getBody), core)
+		},
+	}
+}
+
 // checkSubmittedMotivationRetrievableExisting submits a unique
 // motivation via POST /motivation, then polls GET /motivation up to
 // retrievableExistingDefaultAttempts times (sleeping
