@@ -518,6 +518,97 @@ func runRetrievableExisting(ctx context.Context, env *Env, attempts int, sleep t
 		getMethod, getPath, payload, attempts)
 }
 
+// multipleRetrievableSubmissions is the number of unique motivations
+// checkMultipleMotivationsRetrievable submits in isolated mode.
+const multipleRetrievableSubmissions = 3
+
+// multipleRetrievableMaxAttempts caps the number of GET /motivation
+// calls checkMultipleMotivationsRetrievable issues while trying to
+// observe each submitted text. Per UAT.md ("Multiple submitted
+// motivations are retrievable"), this is twice the submitted count:
+// the service shuffles a queue of size N and only reshuffles after a
+// full cycle, so 2N attempts guarantee every entry appears at least
+// once regardless of where the cycle boundary fell.
+const multipleRetrievableMaxAttempts = 2 * multipleRetrievableSubmissions
+
+// checkMultipleMotivationsRetrievable submits three unique motivations
+// via POST /motivation, then calls GET /motivation up to six times and
+// asserts that every response is 200 OK with a body matching one of
+// the submitted texts and that all three submitted texts are observed
+// at least once. Tagged destructive because deterministic coverage of
+// the full set requires an isolated database; selection logic in
+// selection.go excludes it from existing-service mode.
+func checkMultipleMotivationsRetrievable() Check {
+	return Check{
+		Name: "multiple submitted motivations are retrievable (isolated)",
+		Kind: destructive,
+		Run: func(ctx context.Context, env *Env) error {
+			return runMultipleMotivationsRetrievable(ctx, env,
+				multipleRetrievableSubmissions,
+				multipleRetrievableMaxAttempts)
+		},
+	}
+}
+
+// runMultipleMotivationsRetrievable implements the body of
+// checkMultipleMotivationsRetrievable with a configurable submission
+// count and GET attempt budget so tests can exercise the failure paths
+// without paying for the production-tuned defaults.
+func runMultipleMotivationsRetrievable(ctx context.Context, env *Env, count, maxAttempts int) error {
+	const postMethod, postPath = http.MethodPost, "/motivation"
+	submitted := make([]string, 0, count)
+	remaining := make(map[string]bool, count)
+	for i := 1; i <= count; i++ {
+		payload := fmt.Sprintf("uat multi %s #%d", env.RunID, i)
+		submitted = append(submitted, payload)
+		remaining[payload] = true
+		resp, _, err := doRequest(ctx, env, postMethod, postPath, strings.NewReader(payload))
+		if err != nil {
+			return err
+		}
+		if err := assertStatus(postMethod, postPath, resp.StatusCode, http.StatusCreated); err != nil {
+			return err
+		}
+	}
+
+	const getMethod, getPath = http.MethodGet, "/motivation"
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, body, err := doRequest(ctx, env, getMethod, getPath, nil)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("%s %s: attempt %d status got=%d want=%d",
+				getMethod, getPath, attempt, resp.StatusCode, http.StatusOK)
+		}
+		got := string(body)
+		known := false
+		for _, s := range submitted {
+			if s == got {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return fmt.Errorf("%s %s: attempt %d returned unexpected body %q; expected one of %q",
+				getMethod, getPath, attempt, got, submitted)
+		}
+		delete(remaining, got)
+		if len(remaining) == 0 {
+			return nil
+		}
+	}
+
+	missing := make([]string, 0, len(remaining))
+	for _, s := range submitted {
+		if remaining[s] {
+			missing = append(missing, s)
+		}
+	}
+	return fmt.Errorf("%s %s: submitted motivations not observed after %d attempts: %q",
+		getMethod, getPath, maxAttempts, missing)
+}
+
 // checkEmptyMotivationCollection verifies that GET /motivation on a
 // service with no stored motivations returns 404 Not Found with the
 // documented "No motivations found" body. Tagged destructive because it

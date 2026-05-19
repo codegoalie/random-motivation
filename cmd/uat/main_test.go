@@ -1633,3 +1633,146 @@ func TestCheckSubmittedMotivationRetrievableExisting_FailsWhenSubmittedTextNever
 		}
 	}
 }
+
+func TestCheckMultipleMotivationsRetrievable_PassesWhenAllSubmittedTextsCycle(t *testing.T) {
+	var submitted []string
+	var gets atomic.Int32
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			submitted = append(submitted, string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			n := int(gets.Add(1)) - 1
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, submitted[n%len(submitted)])
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-multi"
+	c := checkMultipleMotivationsRetrievable()
+	if err := c.Run(context.Background(), env); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if len(submitted) != multipleRetrievableSubmissions {
+		t.Errorf("expected %d POSTs, got %d (submitted=%q)",
+			multipleRetrievableSubmissions, len(submitted), submitted)
+	}
+	for i, s := range submitted {
+		want := fmt.Sprintf("uat multi %s #%d", env.RunID, i+1)
+		if s != want {
+			t.Errorf("submitted[%d]=%q, want %q", i, s, want)
+		}
+	}
+}
+
+func TestCheckMultipleMotivationsRetrievable_TaggedDestructive(t *testing.T) {
+	c := checkMultipleMotivationsRetrievable()
+	if c.Kind&destructive == 0 {
+		t.Errorf("multiple motivations retrievable check should be tagged destructive, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckMultipleMotivationsRetrievable_FailsWhenSubmittedTextNeverObserved(t *testing.T) {
+	var submitted []string
+	var gets atomic.Int32
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			submitted = append(submitted, string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			// Only ever return the first two submitted texts.
+			n := int(gets.Add(1)) - 1
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, submitted[n%2])
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-multi-missing"
+	err := runMultipleMotivationsRetrievable(context.Background(), env, 3, 6)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	missing := fmt.Sprintf("uat multi %s #3", env.RunID)
+	for _, sub := range []string{"GET", "/motivation", "6 attempts", missing} {
+		if !strings.Contains(msg, sub) {
+			t.Errorf("expected error to mention %q, got: %s", sub, msg)
+		}
+	}
+}
+
+func TestCheckMultipleMotivationsRetrievable_FailsOnUnknownGETBody(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "rogue")
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-multi-rogue"
+	err := runMultipleMotivationsRetrievable(context.Background(), env, 2, 4)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, sub := range []string{"GET", "/motivation", "rogue", "attempt 1"} {
+		if !strings.Contains(msg, sub) {
+			t.Errorf("expected error to mention %q, got: %s", sub, msg)
+		}
+	}
+}
+
+func TestCheckMultipleMotivationsRetrievable_FailsOnNon200GET(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-multi-500"
+	err := runMultipleMotivationsRetrievable(context.Background(), env, 2, 4)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, sub := range []string{"GET", "/motivation", "500", "200", "attempt 1"} {
+		if !strings.Contains(msg, sub) {
+			t.Errorf("expected error to mention %q, got: %s", sub, msg)
+		}
+	}
+}
