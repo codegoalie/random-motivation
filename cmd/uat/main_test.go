@@ -1938,3 +1938,263 @@ func TestCheckRepeatedGETAvailability_FailsOnWrongPOSTStatus(t *testing.T) {
 		}
 	}
 }
+
+// checkNames returns the ordered list of check names from a []Check.
+func checkNames(checks []Check) []string {
+	out := make([]string, len(checks))
+	for i, c := range checks {
+		out[i] = c.Name
+	}
+	return out
+}
+
+func TestBuildExistingServiceSuite_ContainsExpectedChecksInOrder(t *testing.T) {
+	suite := buildExistingServiceSuite()
+	wantOrder := []string{
+		"landing page describes API",
+		"empty motivation POST is rejected",
+		"whitespace motivation POST is rejected",
+		"unsupported methods are rejected with 405",
+		"unknown route returns 404",
+		"submitted motivation is eventually retrievable (existing service)",
+	}
+	gotOrder := checkNames(suite)
+	if len(gotOrder) != len(wantOrder) {
+		t.Fatalf("len mismatch: got=%v want=%v", gotOrder, wantOrder)
+	}
+	for i := range wantOrder {
+		if gotOrder[i] != wantOrder[i] {
+			t.Errorf("position %d: got=%q want=%q", i, gotOrder[i], wantOrder[i])
+		}
+	}
+
+	// After selection with default cfg in modeExisting, all destructive
+	// entries must be filtered out. The current suite contains none,
+	// so the selected list must equal the input list.
+	selected := selectChecks(modeExisting, config{}, suite)
+	for _, c := range selected {
+		if c.Kind&destructive != 0 {
+			t.Errorf("existing-service selected suite still contains destructive check %q", c.Name)
+		}
+	}
+	if len(selected) != len(suite) {
+		t.Errorf("expected selectChecks to keep all entries; got %d, want %d", len(selected), len(suite))
+	}
+}
+
+func TestSelfManagedGroups_OrderingConstraints(t *testing.T) {
+	groups := buildSelfManagedGroups()
+	if len(groups) != 5 {
+		t.Fatalf("expected 5 groups, got %d", len(groups))
+	}
+
+	// Group A
+	a := groups[0]
+	wantA := []string{
+		"landing page describes API",
+		"empty motivation POST is rejected",
+		"whitespace motivation POST is rejected",
+		"unsupported methods are rejected with 405",
+		"unknown route returns 404",
+		"empty motivation collection returns 404",
+		"empty motivation collection PNG returns 404",
+		"submitted motivation is trimmed before storage",
+	}
+	gotA := checkNames(a.checks)
+	if len(gotA) != len(wantA) {
+		t.Fatalf("group A length mismatch: got=%v want=%v", gotA, wantA)
+	}
+	for i := range wantA {
+		if gotA[i] != wantA[i] {
+			t.Errorf("group A position %d: got=%q want=%q", i, gotA[i], wantA[i])
+		}
+	}
+	// emptyCollection (T13) and pngNone (T19) must precede the
+	// trimmed-submission check (T15), which is the only state-
+	// mutating POST in group A.
+	idxEmpty := indexOfName(gotA, "empty motivation collection returns 404")
+	idxPNGNone := indexOfName(gotA, "empty motivation collection PNG returns 404")
+	idxTrimmed := indexOfName(gotA, "submitted motivation is trimmed before storage")
+	if !(idxEmpty < idxTrimmed && idxPNGNone < idxTrimmed) {
+		t.Errorf("group A: empty/pngNone must precede trimmed POST; idxEmpty=%d idxPNGNone=%d idxTrimmed=%d",
+			idxEmpty, idxPNGNone, idxTrimmed)
+	}
+
+	// Group B
+	b := groups[1]
+	wantB := []string{"submitted motivation is retrievable (isolated)"}
+	if got := checkNames(b.checks); !equalStrings(got, wantB) {
+		t.Errorf("group B: got=%v want=%v", got, wantB)
+	}
+
+	// Group C
+	c := groups[2]
+	wantC := []string{
+		"valid motivation POST is accepted",
+		"multiple submitted motivations are retrievable (isolated)",
+		"repeated GET /motivation remains available (isolated)",
+		"PNG render success",
+	}
+	if got := checkNames(c.checks); !equalStrings(got, wantC) {
+		t.Errorf("group C: got=%v want=%v", got, wantC)
+	}
+
+	// Group D
+	d := groups[3]
+	wantD := []string{"PNG render fails when render service is unreachable"}
+	if got := checkNames(d.checks); !equalStrings(got, wantD) {
+		t.Errorf("group D: got=%v want=%v", got, wantD)
+	}
+
+	// Group E
+	e := groups[4]
+	wantE := []string{"PNG render fails when render service returns non-OK"}
+	if got := checkNames(e.checks); !equalStrings(got, wantE) {
+		t.Errorf("group E: got=%v want=%v", got, wantE)
+	}
+}
+
+func indexOfName(names []string, want string) int {
+	for i, n := range names {
+		if n == want {
+			return i
+		}
+	}
+	return -1
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// noopSetup is a renderSetup that returns a placeholder URL and a
+// no-op cleanup, suitable for unit tests that do not need a real
+// render server.
+func noopSetup() (string, func(), error) {
+	return "http://127.0.0.1:1/render", func() {}, nil
+}
+
+func TestRunGroups_AllPassReturnsZero(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	groups := []selfManagedGroup{
+		{name: "g1", checks: []Check{{Name: "c1", Run: func(ctx context.Context, e *Env) error { return nil }}}, setup: noopSetup},
+		{name: "g2", checks: []Check{{Name: "c2", Run: func(ctx context.Context, e *Env) error { return nil }}}, setup: noopSetup},
+	}
+	var calls int
+	runOne := func(ctx context.Context, cfg config, extraEnv []string, checks []Check, stdout, stderr io.Writer) int {
+		calls++
+		// Expect RENDER_SERVICE_URL injected into extraEnv.
+		found := false
+		for _, kv := range extraEnv {
+			if strings.HasPrefix(kv, "RENDER_SERVICE_URL=") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("runOne call %d missing RENDER_SERVICE_URL in extraEnv=%v", calls, extraEnv)
+		}
+		return exitOK
+	}
+	code := runGroups(context.Background(), config{}, groups, &stdout, &stderr, runOne)
+	if code != exitOK {
+		t.Errorf("expected exitOK, got %d; stderr=%q", code, stderr.String())
+	}
+	if calls != 2 {
+		t.Errorf("expected runOne called 2 times, got %d", calls)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "===== group g1 =====") || !strings.Contains(out, "===== group g2 =====") {
+		t.Errorf("expected group headers in stdout, got: %s", out)
+	}
+}
+
+func TestRunGroups_AnyFailureReturnsOne(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	groups := []selfManagedGroup{
+		{name: "g1", checks: []Check{{Name: "c1"}}, setup: noopSetup},
+		{name: "g2", checks: []Check{{Name: "c2"}}, setup: noopSetup},
+		{name: "g3", checks: []Check{{Name: "c3"}}, setup: noopSetup},
+	}
+	var calls int
+	runOne := func(ctx context.Context, cfg config, extraEnv []string, checks []Check, stdout, stderr io.Writer) int {
+		calls++
+		if calls == 2 {
+			return exitBehaviorFailure
+		}
+		return exitOK
+	}
+	code := runGroups(context.Background(), config{}, groups, &stdout, &stderr, runOne)
+	if code != exitBehaviorFailure {
+		t.Errorf("expected exitBehaviorFailure, got %d", code)
+	}
+	// All three groups should still have been attempted.
+	if calls != 3 {
+		t.Errorf("expected runOne called 3 times (no early exit), got %d", calls)
+	}
+}
+
+func TestRunGroups_StopsOnContextCancelBetweenGroups(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	groups := []selfManagedGroup{
+		{name: "g1", checks: []Check{{Name: "c1"}}, setup: noopSetup},
+		{name: "g2", checks: []Check{{Name: "c2"}}, setup: noopSetup},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls int
+	runOne := func(ctx context.Context, cfg config, extraEnv []string, checks []Check, stdout, stderr io.Writer) int {
+		calls++
+		cancel()
+		return exitOK
+	}
+	code := runGroups(ctx, config{}, groups, &stdout, &stderr, runOne)
+	if code != exitBehaviorFailure {
+		t.Errorf("expected exitBehaviorFailure on ctx cancel, got %d", code)
+	}
+	if calls != 1 {
+		t.Errorf("expected runOne called 1 time before ctx cancel detected, got %d", calls)
+	}
+}
+
+func TestPickUnreachableAddr(t *testing.T) {
+	rawURL, err := pickUnreachableAddr()
+	if err != nil {
+		t.Fatalf("pickUnreachableAddr error: %v", err)
+	}
+	if !strings.HasSuffix(rawURL, "/render") {
+		t.Errorf("expected URL to end with /render, got %q", rawURL)
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("url.Parse(%q) error: %v", rawURL, err)
+	}
+	// Attempt a TCP dial: it must fail because we closed the listener.
+	conn, err := net.DialTimeout("tcp", parsed.Host, 500*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		t.Errorf("expected dial to %s to fail (port should be closed)", parsed.Host)
+	}
+}
+
+func TestNewFailingRender(t *testing.T) {
+	srv, urlStr := newFailingRender(http.StatusInternalServerError)
+	defer srv.Close()
+	if !strings.HasSuffix(urlStr, "/render") {
+		t.Errorf("expected URL to end with /render, got %q", urlStr)
+	}
+	resp, err := http.Get(urlStr + "?text=anything")
+	if err != nil {
+		t.Fatalf("GET failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected status 500, got %d", resp.StatusCode)
+	}
+}

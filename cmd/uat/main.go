@@ -10,7 +10,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -907,6 +909,205 @@ func checkUnknownRoute() Check {
 	}
 }
 
+// buildExistingServiceSuite returns the ordered list of checks for
+// existing-service mode. Selection (selectChecks) automatically drops
+// destructive entries; render-required checks would also need a
+// --render-url. The list intentionally contains only nonDestructive
+// checks today: render-required checks (T18, T20, T21) are all also
+// destructive and therefore unreachable in existing-service mode even
+// when --render-url is supplied.
+func buildExistingServiceSuite() []Check {
+	return []Check{
+		checkLandingPage(),                            // T7
+		checkEmptyPOSTRejected(),                      // T8
+		checkWhitespacePOSTRejected(),                 // T9
+		checkUnsupportedMethods(),                     // T11
+		checkUnknownRoute(),                           // T12
+		checkSubmittedMotivationRetrievableExisting(), // T14-existing
+	}
+}
+
+// renderSetup provisions a render endpoint for one self-managed group.
+// It returns the RENDER_SERVICE_URL to inject into the child env and
+// a cleanup function the caller MUST invoke when the group is done.
+// The cleanup function is never nil so callers can defer it
+// unconditionally.
+type renderSetup func() (renderURL string, cleanup func(), err error)
+
+// selfManagedGroup is a single self-managed run: a fresh DB +
+// tailored render endpoint + an ordered slice of checks. Groups exist
+// because some checks (T15, T14-isolated) require a single-entry
+// queue and render-failure checks (T20, T21) require different
+// RENDER_SERVICE_URL values; both can only be guaranteed with a
+// fresh supervisor spawn.
+type selfManagedGroup struct {
+	name   string
+	checks []Check
+	setup  renderSetup
+}
+
+// fakeRenderSuccessSetup provisions a fake render server returning a
+// 1x1 PNG. RENDER_SERVICE_URL must include the /render path because
+// the application appends ?text=... directly.
+func fakeRenderSuccessSetup() (string, func(), error) {
+	fr := newFakeRender()
+	return fr.URL() + "/render", fr.Close, nil
+}
+
+// unreachableRenderSetup picks an address on 127.0.0.1 that is not
+// listening at the moment the supervisor starts. There is a small race
+// window between picking the port and the child starting, but it is
+// acceptable for UAT.
+func unreachableRenderSetup() (string, func(), error) {
+	url, err := pickUnreachableAddr()
+	if err != nil {
+		return "", func() {}, err
+	}
+	return url, func() {}, nil
+}
+
+// failingRenderSetup returns a renderSetup that stands up a stub
+// render server which responds with the given status to every
+// request.
+func failingRenderSetup(status int) renderSetup {
+	return func() (string, func(), error) {
+		srv, url := newFailingRender(status)
+		return url, srv.Close, nil
+	}
+}
+
+// pickUnreachableAddr opens a listener on 127.0.0.1:0, captures the
+// URL, and closes the listener before returning. The returned URL
+// includes the /render path so it matches the application's
+// expectation that RENDER_SERVICE_URL already contains the full
+// render endpoint.
+func pickUnreachableAddr() (string, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", fmt.Errorf("pickUnreachableAddr listen: %w", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		return "", fmt.Errorf("pickUnreachableAddr close: %w", err)
+	}
+	return "http://" + addr + "/render", nil
+}
+
+// newFailingRender starts a stub render server that responds with the
+// given status code (and an empty body) to every request. It returns
+// the server (so the caller can Close it) and the RENDER_SERVICE_URL
+// the application should be pointed at, including the /render path.
+func newFailingRender(status int) (*httptest.Server, string) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+	}))
+	return srv, srv.URL + "/render"
+}
+
+// buildSelfManagedGroups assembles the five sequential groups that
+// make up the self-managed suite. Ordering rationale:
+//
+//   - Group A: empty-DB and PNG-empty-DB assertions before any
+//     state-mutating POST; T15 is the sole mutating POST and must
+//     therefore be last.
+//   - Group B: T14-isolated needs a single-entry DB after its own
+//     POST.
+//   - Group C: T10/T16/T17/T18 each grow the DB; T18 runs last so
+//     its single POST is observable on the PNG endpoint.
+//   - Group D: render unreachable.
+//   - Group E: render returns 500.
+func buildSelfManagedGroups() []selfManagedGroup {
+	return []selfManagedGroup{
+		{
+			name: "A-fake-render-empty-and-trimmed",
+			checks: []Check{
+				checkLandingPage(),                // T7
+				checkEmptyPOSTRejected(),          // T8
+				checkWhitespacePOSTRejected(),     // T9
+				checkUnsupportedMethods(),         // T11
+				checkUnknownRoute(),               // T12
+				checkEmptyMotivationCollection(),  // T13 (pre-POST)
+				checkPNGNoMotivations(),           // T19 (pre-POST)
+				checkTrimmedSubmission(),          // T15 (first POST)
+			},
+			setup: fakeRenderSuccessSetup,
+		},
+		{
+			name: "B-fake-render-isolated-retrieval",
+			checks: []Check{
+				checkSubmittedMotivationRetrievableIsolated(), // T14-isolated
+			},
+			setup: fakeRenderSuccessSetup,
+		},
+		{
+			name: "C-fake-render-multi-and-png",
+			checks: []Check{
+				checkValidPOSTAccepted(),                // T10
+				checkMultipleMotivationsRetrievable(),   // T16
+				checkRepeatedGETAvailability(),          // T17
+				checkPNGRenderSuccess(),                 // T18
+			},
+			setup: fakeRenderSuccessSetup,
+		},
+		{
+			name:   "D-render-unreachable",
+			checks: []Check{checkRenderServiceUnreachable()}, // T20
+			setup:  unreachableRenderSetup,
+		},
+		{
+			name:   "E-render-non-ok",
+			checks: []Check{checkRenderServiceNonOK()}, // T21
+			setup:  failingRenderSetup(http.StatusInternalServerError),
+		},
+	}
+}
+
+// runFunc matches the signature of run() so runGroups can be unit-
+// tested without spawning real subprocesses.
+type runFunc func(ctx context.Context, cfg config, extraEnv []string, checks []Check, stdout, stderr io.Writer) int
+
+// runGroups executes each group in order, sharing the overall ctx
+// (so --timeout covers the full suite). It returns exitOK only when
+// every group's runOne returns exitOK. On any failure it returns
+// exitBehaviorFailure but still attempts every remaining group so
+// operators get a complete picture in one run. If ctx is cancelled
+// or has expired between groups it stops early.
+func runGroups(ctx context.Context, cfg config, groups []selfManagedGroup, stdout, stderr io.Writer, runOne runFunc) int {
+	final := exitOK
+	for _, g := range groups {
+		if err := ctx.Err(); err != nil {
+			fmt.Fprintf(stderr, "context cancelled before group %s: %v\n", g.name, err)
+			return exitBehaviorFailure
+		}
+		fmt.Fprintf(stdout, "===== group %s =====\n", g.name)
+		renderURL, cleanup, err := g.setup()
+		if err != nil {
+			fmt.Fprintf(stderr, "group %s render setup failed: %v\n", g.name, err)
+			if cleanup != nil {
+				cleanup()
+			}
+			final = exitBehaviorFailure
+			continue
+		}
+		extraEnv := []string{"RENDER_SERVICE_URL=" + renderURL}
+		// Apply selectChecks so --skip-destructive still drops
+		// checks even in self-managed mode.
+		selected := selectChecks(modeSelfManaged, cfg, g.checks)
+		code := runOne(ctx, cfg, extraEnv, selected, stdout, stderr)
+		cleanup()
+		if code != exitOK {
+			final = exitBehaviorFailure
+		}
+	}
+	return final
+}
+
+// runSelfManagedSuite builds the self-managed groups and runs them
+// against the real run() function.
+func runSelfManagedSuite(ctx context.Context, cfg config, stdout, stderr io.Writer) int {
+	return runGroups(ctx, cfg, buildSelfManagedGroups(), stdout, stderr, run)
+}
+
 func main() {
 	cfg, code := parseConfig(os.Args[1:], os.Stdout, os.Stderr)
 	if code != exitOK {
@@ -914,18 +1115,19 @@ func main() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
 	defer cancel()
-	// No checks are wired yet; later beads register the actual suite.
-	checks := []Check{}
-	if len(checks) == 0 {
-		fmt.Fprintln(os.Stdout, "UAT skeleton ready")
-		os.Exit(exitOK)
+
+	if selectMode(cfg) == modeExisting {
+		checks := selectChecks(modeExisting, cfg, buildExistingServiceSuite())
+		// Propagate --render-url into extraEnv for symmetry with
+		// self-managed mode. In existing-service mode run() does not
+		// spawn a subprocess, so extraEnv is currently unused; pass
+		// it anyway in case future checks need it.
+		var extraEnv []string
+		if cfg.renderURL != "" {
+			extraEnv = append(extraEnv, "RENDER_SERVICE_URL="+cfg.renderURL)
+		}
+		os.Exit(run(ctx, cfg, extraEnv, checks, os.Stdout, os.Stderr))
 	}
-	// Default extraEnv for self-managed mode: propagate --render-url
-	// into the child as RENDER_SERVICE_URL so the spawned service
-	// points at the same render endpoint the suite asserts against.
-	var extraEnv []string
-	if cfg.renderURL != "" {
-		extraEnv = append(extraEnv, "RENDER_SERVICE_URL="+cfg.renderURL)
-	}
-	os.Exit(run(ctx, cfg, extraEnv, checks, os.Stdout, os.Stderr))
+
+	os.Exit(runSelfManagedSuite(ctx, cfg, os.Stdout, os.Stderr))
 }
