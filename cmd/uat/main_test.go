@@ -865,6 +865,60 @@ func TestCheckEmptyMotivationCollection_FailsOnWrongBody(t *testing.T) {
 	}
 }
 
+func TestCheckPNGNoMotivations_PassesWhen404AndExpectedBody(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/motivations.png" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, "No motivations found")
+	})
+	if err := runCheckAgainst(t, h, checkPNGNoMotivations); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestCheckPNGNoMotivations_TaggedDestructive(t *testing.T) {
+	c := checkPNGNoMotivations()
+	if c.Kind&destructive == 0 {
+		t.Errorf("PNG no motivations check should be tagged destructive, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckPNGNoMotivations_FailsWhen200(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "\x89PNG\r\n\x1a\n")
+	})
+	err := runCheckAgainst(t, h, checkPNGNoMotivations)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "/motivations.png", "404", "200"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
+func TestCheckPNGNoMotivations_FailsOnWrongBody(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, "not the expected body")
+	})
+	err := runCheckAgainst(t, h, checkPNGNoMotivations)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"GET", "/motivations.png", "No motivations found"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to mention %q, got: %s", want, msg)
+		}
+	}
+}
+
 func TestCheckUnsupportedMethods_PassesWhenAll405(t *testing.T) {
 	type seenKey struct{ method, path string }
 	seen := map[seenKey]bool{}

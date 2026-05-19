@@ -399,6 +399,29 @@ func checkEmptyMotivationCollection() Check {
 	}
 }
 
+// checkPNGNoMotivations verifies that GET /motivations.png on a service
+// with no stored motivations returns 404 Not Found with the documented
+// "No motivations found" body. Tagged destructive because it presumes
+// an empty database: selection logic in selection.go excludes it from
+// existing-service mode so it only runs in isolated self-managed mode.
+func checkPNGNoMotivations() Check {
+	return Check{
+		Name: "empty motivation collection PNG returns 404",
+		Kind: destructive,
+		Run: func(ctx context.Context, env *Env) error {
+			const method, path = http.MethodGet, "/motivations.png"
+			resp, body, err := doRequest(ctx, env, method, path, nil)
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(method, path, resp.StatusCode, http.StatusNotFound); err != nil {
+				return err
+			}
+			return assertBodyContains(method, path, string(body), "No motivations found")
+		},
+	}
+}
+
 // checkUnsupportedMethods verifies that the service rejects HTTP
 // methods that are not part of the documented API with 405 Method Not
 // Allowed. It exercises PUT /motivation, DELETE /motivation, and
