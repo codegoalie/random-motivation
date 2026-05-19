@@ -1984,8 +1984,8 @@ func TestBuildExistingServiceSuite_ContainsExpectedChecksInOrder(t *testing.T) {
 
 func TestSelfManagedGroups_OrderingConstraints(t *testing.T) {
 	groups := buildSelfManagedGroups()
-	if len(groups) != 5 {
-		t.Fatalf("expected 5 groups, got %d", len(groups))
+	if len(groups) != 7 {
+		t.Fatalf("expected 7 groups, got %d", len(groups))
 	}
 
 	// Group A
@@ -2020,37 +2020,49 @@ func TestSelfManagedGroups_OrderingConstraints(t *testing.T) {
 			idxEmpty, idxPNGNone, idxTrimmed)
 	}
 
-	// Group B
+	// Group B: T14-isolated alone (single-entry state).
 	b := groups[1]
 	wantB := []string{"submitted motivation is retrievable (isolated)"}
 	if got := checkNames(b.checks); !equalStrings(got, wantB) {
 		t.Errorf("group B: got=%v want=%v", got, wantB)
 	}
 
-	// Group C
+	// Group C: T10 + T18 share a DB (neither asserts solo state).
 	c := groups[2]
 	wantC := []string{
 		"valid motivation POST is accepted",
-		"multiple submitted motivations are retrievable (isolated)",
-		"repeated GET /motivation remains available (isolated)",
 		"PNG render success",
 	}
 	if got := checkNames(c.checks); !equalStrings(got, wantC) {
 		t.Errorf("group C: got=%v want=%v", got, wantC)
 	}
 
-	// Group D
+	// Group D: T16 needs solo state.
 	d := groups[3]
-	wantD := []string{"PNG render fails when render service is unreachable"}
+	wantD := []string{"multiple submitted motivations are retrievable (isolated)"}
 	if got := checkNames(d.checks); !equalStrings(got, wantD) {
 		t.Errorf("group D: got=%v want=%v", got, wantD)
 	}
 
-	// Group E
+	// Group E: T17 needs solo state.
 	e := groups[4]
-	wantE := []string{"PNG render fails when render service returns non-OK"}
+	wantE := []string{"repeated GET /motivation remains available (isolated)"}
 	if got := checkNames(e.checks); !equalStrings(got, wantE) {
 		t.Errorf("group E: got=%v want=%v", got, wantE)
+	}
+
+	// Group F: render unreachable.
+	f := groups[5]
+	wantF := []string{"PNG render fails when render service is unreachable"}
+	if got := checkNames(f.checks); !equalStrings(got, wantF) {
+		t.Errorf("group F: got=%v want=%v", got, wantF)
+	}
+
+	// Group G: render non-OK.
+	g := groups[6]
+	wantG := []string{"PNG render fails when render service returns non-OK"}
+	if got := checkNames(g.checks); !equalStrings(got, wantG) {
+		t.Errorf("group G: got=%v want=%v", got, wantG)
 	}
 }
 

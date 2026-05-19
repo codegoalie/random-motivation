@@ -1004,31 +1004,40 @@ func newFailingRender(status int) (*httptest.Server, string) {
 	return srv, srv.URL + "/render"
 }
 
-// buildSelfManagedGroups assembles the five sequential groups that
-// make up the self-managed suite. Ordering rationale:
+// buildSelfManagedGroups assembles the sequential groups that make up
+// the self-managed suite. Each group runs in its own freshly-spawned
+// service subprocess with an isolated database, so destructive checks
+// that assert on specific queue contents get the state they expect.
+//
+// Ordering rationale:
 //
 //   - Group A: empty-DB and PNG-empty-DB assertions before any
 //     state-mutating POST; T15 is the sole mutating POST and must
-//     therefore be last.
-//   - Group B: T14-isolated needs a single-entry DB after its own
-//     POST.
-//   - Group C: T10/T16/T17/T18 each grow the DB; T18 runs last so
-//     its single POST is observable on the PNG endpoint.
-//   - Group D: render unreachable.
-//   - Group E: render returns 500.
+//     therefore be last so its GET equality check sees a single entry.
+//   - Group B: T14-isolated needs a single-entry DB after its own POST.
+//   - Group C: T10 (validate POST) and T18 (PNG render success) both
+//     work in a shared DB because neither asserts that the queue
+//     contains only their submissions. T10 runs first to keep
+//     diagnostic output predictable; T18's POST then PNG fetch is
+//     unaffected by T10's entry.
+//   - Group D: T16 requires a fresh DB because it asserts every GET
+//     returns one of its three submissions.
+//   - Group E: T17 has the same isolation requirement as T16.
+//   - Group F: render service unreachable.
+//   - Group G: render service returns 500.
 func buildSelfManagedGroups() []selfManagedGroup {
 	return []selfManagedGroup{
 		{
 			name: "A-fake-render-empty-and-trimmed",
 			checks: []Check{
-				checkLandingPage(),                // T7
-				checkEmptyPOSTRejected(),          // T8
-				checkWhitespacePOSTRejected(),     // T9
-				checkUnsupportedMethods(),         // T11
-				checkUnknownRoute(),               // T12
-				checkEmptyMotivationCollection(),  // T13 (pre-POST)
-				checkPNGNoMotivations(),           // T19 (pre-POST)
-				checkTrimmedSubmission(),          // T15 (first POST)
+				checkLandingPage(),               // T7
+				checkEmptyPOSTRejected(),         // T8
+				checkWhitespacePOSTRejected(),    // T9
+				checkUnsupportedMethods(),        // T11
+				checkUnknownRoute(),              // T12
+				checkEmptyMotivationCollection(), // T13 (pre-POST)
+				checkPNGNoMotivations(),          // T19 (pre-POST)
+				checkTrimmedSubmission(),         // T15 (first POST)
 			},
 			setup: fakeRenderSuccessSetup,
 		},
@@ -1040,22 +1049,34 @@ func buildSelfManagedGroups() []selfManagedGroup {
 			setup: fakeRenderSuccessSetup,
 		},
 		{
-			name: "C-fake-render-multi-and-png",
+			name: "C-fake-render-valid-post-and-png",
 			checks: []Check{
-				checkValidPOSTAccepted(),                // T10
-				checkMultipleMotivationsRetrievable(),   // T16
-				checkRepeatedGETAvailability(),          // T17
-				checkPNGRenderSuccess(),                 // T18
+				checkValidPOSTAccepted(), // T10
+				checkPNGRenderSuccess(),  // T18
 			},
 			setup: fakeRenderSuccessSetup,
 		},
 		{
-			name:   "D-render-unreachable",
+			name: "D-fake-render-multiple-retrievable",
+			checks: []Check{
+				checkMultipleMotivationsRetrievable(), // T16 (needs solo state)
+			},
+			setup: fakeRenderSuccessSetup,
+		},
+		{
+			name: "E-fake-render-repeated-availability",
+			checks: []Check{
+				checkRepeatedGETAvailability(), // T17 (needs solo state)
+			},
+			setup: fakeRenderSuccessSetup,
+		},
+		{
+			name:   "F-render-unreachable",
 			checks: []Check{checkRenderServiceUnreachable()}, // T20
 			setup:  unreachableRenderSetup,
 		},
 		{
-			name:   "E-render-non-ok",
+			name:   "G-render-non-ok",
 			checks: []Check{checkRenderServiceNonOK()}, // T21
 			setup:  failingRenderSetup(http.StatusInternalServerError),
 		},
