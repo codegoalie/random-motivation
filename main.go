@@ -41,6 +41,14 @@ func (mq *MotivationQueue) Next() (string, error) {
 	return motivation, nil
 }
 
+// Add appends a motivation to the end of the queue.
+func (mq *MotivationQueue) Add(motivation string) {
+	mq.mu.Lock()
+	defer mq.mu.Unlock()
+
+	mq.motivations = append(mq.motivations, motivation)
+}
+
 // NewMotivationQueue creates a new queue from a list of motivations and shuffles them
 func NewMotivationQueue(motivations []db.Motivation) *MotivationQueue {
 	texts := make([]string, len(motivations))
@@ -153,6 +161,7 @@ func getMotivation(c echo.Context) error {
 // postMotivation inserts a new motivation into the database
 func postMotivation(c echo.Context) error {
 	database := c.Get("db").(*db.DB)
+	queue := c.Get("queue").(*MotivationQueue)
 
 	// Read the request body
 	body, err := io.ReadAll(c.Request().Body)
@@ -170,6 +179,7 @@ func postMotivation(c echo.Context) error {
 	if err != nil {
 		return c.String(http.StatusInternalServerError, "Error saving motivation")
 	}
+	queue.Add(motivation)
 
 	return c.String(http.StatusCreated, "Motivation added successfully")
 }

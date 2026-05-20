@@ -45,6 +45,21 @@ go test ./...          # Run all tests
 go test -v ./...       # Run tests with verbose output
 ```
 
+### UAT (User Acceptance Testing)
+The repository ships a black-box UAT suite under `cmd/uat` that interacts only
+via the public HTTP API and process-level controls (no app imports, no direct
+DB access).
+```bash
+# Against an already-running service (read-only + eventual-retrieval checks)
+go run ./cmd/uat --base-url http://localhost:8080
+
+# Self-managed isolated mode with fresh DB and fake render service
+go run ./cmd/uat --start-command "go run ." --base-url http://localhost:8080 --timeout 30s
+
+# Useful flags: --timeout, --verbose, --skip-destructive, --render-url
+```
+Exit codes: `0` all checks passed, `1` behavioral failures, `2` invalid CLI usage.
+
 ### Database Operations
 ```bash
 # View database content
@@ -64,6 +79,8 @@ sqlite3 motivations.db "SELECT COUNT(*) FROM motivations;"
 │   ├── migrations.go          # Schema creation
 │   ├── repository.go          # Data access methods (CRUD operations)
 │   └── migrate_text.go        # Text file to SQLite migration
+├── cmd/
+│   └── uat/                   # Black-box UAT suite (see Development > UAT)
 ├── go.mod                     # Go module definition (Go 1.25.3)
 ├── motivations.db             # SQLite database (generated at runtime)
 ├── motivations.txt.backup     # Backup of original text file
@@ -122,3 +139,50 @@ Possible additions:
 - Search and filtering capabilities
 - Categories and tags
 - User voting/favorites system
+
+<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
+## Beads Issue Tracker
+
+This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+
+### Quick Reference
+
+```bash
+bd ready              # Find available work
+bd show <id>          # View issue details
+bd update <id> --claim  # Claim work
+bd close <id>         # Complete work
+```
+
+### Rules
+
+- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Run `bd prime` for detailed command reference and session close protocol
+- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+
+## Session Completion
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   bd dolt push
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds
+<!-- END BEADS INTEGRATION -->
