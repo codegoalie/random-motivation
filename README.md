@@ -28,6 +28,9 @@ The server will start on `http://localhost:8080`
 
 ```bash
 curl http://localhost:8080/motivation
+
+# Or with HTTPie
+http localhost:8080/motivation
 ```
 
 **Response:** A random motivational quote as plain text
@@ -42,6 +45,9 @@ curl http://localhost:8080/motivation
 
 ```bash
 curl -X POST -d "Your motivational quote here" http://localhost:8080/motivation
+
+# Or with HTTPie (--raw sends the body as plain text, not JSON)
+http --raw "Your motivational quote here" POST localhost:8080/motivation
 ```
 
 **Response:** `Motivation added successfully`
