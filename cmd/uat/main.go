@@ -497,7 +497,7 @@ func runRetrievableExisting(ctx context.Context, env *Env, attempts int, sleep t
 	}
 
 	const getMethod, getPath = http.MethodGet, "/motivation"
-	for i := 0; i < attempts; i++ {
+	for i := range attempts {
 		if i > 0 {
 			select {
 			case <-ctx.Done():
