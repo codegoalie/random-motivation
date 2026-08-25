@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -295,10 +296,16 @@ func checkLandingPage() Check {
 			if err := assertStatus(method, path, resp.StatusCode, http.StatusOK); err != nil {
 				return err
 			}
+			// "GET /motivation" is a substring of "GET /motivations", so
+			// listing the singular endpoint before the plural one does
+			// not weaken this assertion — both snippets are checked
+			// independently and neither can satisfy the other's absence.
 			snippets := []string{
 				"Welcome to the Random Motivation API",
 				"GET /motivation",
 				"POST /motivation",
+				"GET /motivations",
+				"DELETE /motivation/:id",
 				"GET /motivations.png",
 			}
 			for _, s := range snippets {
@@ -909,6 +916,384 @@ func checkUnknownRoute() Check {
 	}
 }
 
+// motivationListItem mirrors the JSON shape of one entry returned by
+// GET /motivations. It is a local decoding target rather than a
+// db.Motivation import: this suite is strictly black-box and must not
+// depend on application packages.
+type motivationListItem struct {
+	ID        int64  `json:"id"`
+	Text      string `json:"text"`
+	CreatedAt string `json:"created_at"`
+}
+
+// decodeMotivationList parses a GET /motivations response body into a
+// slice of motivationListItem. Note that "null" is valid JSON and
+// decodes successfully to a nil/empty slice without error; callers
+// that must distinguish "null" from "[]" (e.g. checkMotivationsListEmpty)
+// need to check the raw body themselves before decoding.
+func decodeMotivationList(body []byte) ([]motivationListItem, error) {
+	var items []motivationListItem
+	if err := json.Unmarshal(body, &items); err != nil {
+		return nil, fmt.Errorf("decode motivations list: %w (body=%q)", err, string(body))
+	}
+	return items, nil
+}
+
+// checkMotivationsListEmpty verifies that GET /motivations on a
+// service with no stored motivations returns 200 with a body that
+// parses as an empty JSON array -- specifically not the literal
+// "null", which encoding/json would also accept for a nil slice.
+// Tagged destructive because it presumes an empty database: selection
+// logic in selection.go excludes it from existing-service mode so it
+// only runs in isolated self-managed mode, before any POST.
+func checkMotivationsListEmpty() Check {
+	return Check{
+		Name: "empty motivations list returns empty JSON array",
+		Kind: destructive,
+		Run: func(ctx context.Context, env *Env) error {
+			const method, path = http.MethodGet, "/motivations"
+			resp, body, err := doRequest(ctx, env, method, path, nil)
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(method, path, resp.StatusCode, http.StatusOK); err != nil {
+				return err
+			}
+			if trimmed := strings.TrimSpace(string(body)); trimmed == "null" {
+				return fmt.Errorf("%s %s: body is %q, want an empty JSON array (not null)", method, path, trimmed)
+			}
+			items, err := decodeMotivationList(body)
+			if err != nil {
+				return err
+			}
+			if len(items) != 0 {
+				return fmt.Errorf("%s %s: expected empty array, got %d entries (body=%q)",
+					method, path, len(items), string(body))
+			}
+			return nil
+		},
+	}
+}
+
+// checkMotivationsListAfterPost submits a unique motivation via
+// POST /motivation, then verifies GET /motivations returns 200 with a
+// body that decodes to exactly one entry whose text matches what was
+// submitted, whose id is a positive integer, and whose created_at is
+// non-empty. Tagged destructive because deterministic single-entry
+// assertions require an isolated database; selection logic in
+// selection.go excludes it from existing-service mode.
+func checkMotivationsListAfterPost() Check {
+	return Check{
+		Name: "motivations list reflects a single POST (isolated)",
+		Kind: destructive,
+		Run: func(ctx context.Context, env *Env) error {
+			const postMethod, postPath = http.MethodPost, "/motivation"
+			payload := "uat-list-after-post-" + env.RunID
+			postResp, _, err := doRequest(ctx, env, postMethod, postPath, strings.NewReader(payload))
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(postMethod, postPath, postResp.StatusCode, http.StatusCreated); err != nil {
+				return err
+			}
+
+			const getMethod, getPath = http.MethodGet, "/motivations"
+			getResp, getBody, err := doRequest(ctx, env, getMethod, getPath, nil)
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(getMethod, getPath, getResp.StatusCode, http.StatusOK); err != nil {
+				return err
+			}
+			items, err := decodeMotivationList(getBody)
+			if err != nil {
+				return err
+			}
+			if len(items) != 1 {
+				return fmt.Errorf("%s %s: expected exactly 1 entry, got %d (body=%q)",
+					getMethod, getPath, len(items), string(getBody))
+			}
+			item := items[0]
+			if item.Text != payload {
+				return fmt.Errorf("%s %s: entry text = %q, want %q", getMethod, getPath, item.Text, payload)
+			}
+			if item.ID <= 0 {
+				return fmt.Errorf("%s %s: entry id = %d, want positive integer", getMethod, getPath, item.ID)
+			}
+			if strings.TrimSpace(item.CreatedAt) == "" {
+				return fmt.Errorf("%s %s: entry created_at is empty", getMethod, getPath)
+			}
+			return nil
+		},
+	}
+}
+
+// checkDeleteUnknownID verifies that DELETE /motivation/:id for an id
+// that cannot possibly exist (the maximum int64 value) returns 404
+// with the documented "Motivation not found" body. Tagged
+// non-destructive: it is safe against any deployment because no row
+// can plausibly have this id (auto-increment primary keys never reach
+// it), so nothing is mutated and no real data can be deleted.
+func checkDeleteUnknownID() Check {
+	return Check{
+		Name: "DELETE unknown motivation id returns 404",
+		Kind: nonDestructive,
+		Run: func(ctx context.Context, env *Env) error {
+			const method = http.MethodDelete
+			const path = "/motivation/9223372036854775807"
+			resp, body, err := doRequest(ctx, env, method, path, nil)
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(method, path, resp.StatusCode, http.StatusNotFound); err != nil {
+				return err
+			}
+			return assertBodyContains(method, path, string(body), "Motivation not found")
+		},
+	}
+}
+
+// checkDeleteInvalidID verifies that DELETE /motivation/:id returns
+// 400 with the documented "Invalid motivation id" body for several
+// unparseable id forms: a non-numeric string, a float, and a string
+// with a run-unique suffix (to rule out any accidental match against
+// real data). Tagged non-destructive: every variant fails to parse as
+// an integer id before the server can look anything up, so nothing is
+// mutated and the check is safe against any deployment.
+func checkDeleteInvalidID() Check {
+	return Check{
+		Name: "DELETE unparseable motivation id returns 400",
+		Kind: nonDestructive,
+		Run: func(ctx context.Context, env *Env) error {
+			const method = http.MethodDelete
+			ids := []string{
+				"not-a-number",
+				"1.5",
+				"id-" + env.RunID,
+			}
+			for _, id := range ids {
+				path := "/motivation/" + id
+				resp, body, err := doRequest(ctx, env, method, path, nil)
+				if err != nil {
+					return err
+				}
+				if err := assertStatus(method, path, resp.StatusCode, http.StatusBadRequest); err != nil {
+					return err
+				}
+				if err := assertBodyContains(method, path, string(body), "Invalid motivation id"); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+}
+
+// checkDeleteRemovesFromList submits two unique motivations, uses
+// GET /motivations to learn their ids, deletes the first, and asserts
+// the DELETE returns 204 with an empty body while GET /motivations
+// afterward contains only the second (with the deleted id absent).
+// Tagged destructive because deterministic before/after counts require
+// an isolated database; selection logic in selection.go excludes it
+// from existing-service mode.
+func checkDeleteRemovesFromList() Check {
+	return Check{
+		Name: "DELETE removes a motivation from the list (isolated)",
+		Kind: destructive,
+		Run: func(ctx context.Context, env *Env) error {
+			const postMethod, postPath = http.MethodPost, "/motivation"
+			first := "uat-delete-list-first-" + env.RunID
+			second := "uat-delete-list-second-" + env.RunID
+			for _, payload := range []string{first, second} {
+				resp, _, err := doRequest(ctx, env, postMethod, postPath, strings.NewReader(payload))
+				if err != nil {
+					return err
+				}
+				if err := assertStatus(postMethod, postPath, resp.StatusCode, http.StatusCreated); err != nil {
+					return err
+				}
+			}
+
+			const listMethod, listPath = http.MethodGet, "/motivations"
+			listResp, listBody, err := doRequest(ctx, env, listMethod, listPath, nil)
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(listMethod, listPath, listResp.StatusCode, http.StatusOK); err != nil {
+				return err
+			}
+			items, err := decodeMotivationList(listBody)
+			if err != nil {
+				return err
+			}
+			if len(items) != 2 {
+				return fmt.Errorf("%s %s: expected 2 entries before delete, got %d (body=%q)",
+					listMethod, listPath, len(items), string(listBody))
+			}
+			var firstID, secondID int64
+			for _, item := range items {
+				switch item.Text {
+				case first:
+					firstID = item.ID
+				case second:
+					secondID = item.ID
+				}
+			}
+			if firstID == 0 || secondID == 0 {
+				return fmt.Errorf("%s %s: could not locate both submitted entries in %q",
+					listMethod, listPath, string(listBody))
+			}
+
+			const deleteMethod = http.MethodDelete
+			deletePath := fmt.Sprintf("/motivation/%d", firstID)
+			delResp, delBody, err := doRequest(ctx, env, deleteMethod, deletePath, nil)
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(deleteMethod, deletePath, delResp.StatusCode, http.StatusNoContent); err != nil {
+				return err
+			}
+			if len(delBody) != 0 {
+				return fmt.Errorf("%s %s: expected empty body, got %q", deleteMethod, deletePath, string(delBody))
+			}
+
+			listResp2, listBody2, err := doRequest(ctx, env, listMethod, listPath, nil)
+			if err != nil {
+				return err
+			}
+			if err := assertStatus(listMethod, listPath, listResp2.StatusCode, http.StatusOK); err != nil {
+				return err
+			}
+			items2, err := decodeMotivationList(listBody2)
+			if err != nil {
+				return err
+			}
+			if len(items2) != 1 {
+				return fmt.Errorf("%s %s: expected 1 entry after delete, got %d (body=%q)",
+					listMethod, listPath, len(items2), string(listBody2))
+			}
+			if items2[0].ID == firstID {
+				return fmt.Errorf("%s %s: deleted id %d still present after delete", listMethod, listPath, firstID)
+			}
+			if items2[0].Text != second {
+				return fmt.Errorf("%s %s: remaining entry text = %q, want %q",
+					listMethod, listPath, items2[0].Text, second)
+			}
+			return nil
+		},
+	}
+}
+
+// deletedMotivationRegressionAttempts is the number of GET /motivation
+// calls checkDeletedMotivationNotServed issues after deleting one of
+// two submitted motivations. It comfortably exceeds the post-delete
+// queue size (1) and the pre-delete queue size (2), so were the
+// eviction regression to reappear (the deleted motivation staying in
+// the in-memory rotation instead of being removed on DELETE), the
+// deleted text would almost certainly resurface within this budget.
+const deletedMotivationRegressionAttempts = 8
+
+// checkDeletedMotivationNotServed submits exactly two motivations,
+// deletes one via DELETE /motivation/:id, then calls GET /motivation
+// deletedMotivationRegressionAttempts times and asserts the deleted
+// text is never returned while the surviving text is observed at
+// least once. This is the regression test for the queue-eviction
+// behavior documented alongside DELETE /motivation/:id: deletion must
+// also evict the entry from the in-memory rotation, not just the
+// database row. Tagged destructive and given its own self-managed
+// group (see buildSelfManagedGroups) because it needs solo state: any
+// other motivation sharing the database would make the GET
+// /motivation body assertions non-deterministic.
+func checkDeletedMotivationNotServed() Check {
+	return Check{
+		Name: "deleted motivation stops being served by GET /motivation (isolated)",
+		Kind: destructive,
+		Run: func(ctx context.Context, env *Env) error {
+			return runDeletedMotivationNotServed(ctx, env, deletedMotivationRegressionAttempts)
+		},
+	}
+}
+
+// runDeletedMotivationNotServed implements the body of
+// checkDeletedMotivationNotServed with a configurable GET attempt
+// budget so tests can exercise the failure paths cheaply.
+func runDeletedMotivationNotServed(ctx context.Context, env *Env, attempts int) error {
+	const postMethod, postPath = http.MethodPost, "/motivation"
+	toDelete := "uat-delete-served-victim-" + env.RunID
+	survivor := "uat-delete-served-survivor-" + env.RunID
+	for _, payload := range []string{toDelete, survivor} {
+		resp, _, err := doRequest(ctx, env, postMethod, postPath, strings.NewReader(payload))
+		if err != nil {
+			return err
+		}
+		if err := assertStatus(postMethod, postPath, resp.StatusCode, http.StatusCreated); err != nil {
+			return err
+		}
+	}
+
+	const listMethod, listPath = http.MethodGet, "/motivations"
+	listResp, listBody, err := doRequest(ctx, env, listMethod, listPath, nil)
+	if err != nil {
+		return err
+	}
+	if err := assertStatus(listMethod, listPath, listResp.StatusCode, http.StatusOK); err != nil {
+		return err
+	}
+	items, err := decodeMotivationList(listBody)
+	if err != nil {
+		return err
+	}
+	var victimID int64
+	for _, item := range items {
+		if item.Text == toDelete {
+			victimID = item.ID
+			break
+		}
+	}
+	if victimID == 0 {
+		return fmt.Errorf("%s %s: could not locate victim entry %q in %q",
+			listMethod, listPath, toDelete, string(listBody))
+	}
+
+	const deleteMethod = http.MethodDelete
+	deletePath := fmt.Sprintf("/motivation/%d", victimID)
+	delResp, _, err := doRequest(ctx, env, deleteMethod, deletePath, nil)
+	if err != nil {
+		return err
+	}
+	if err := assertStatus(deleteMethod, deletePath, delResp.StatusCode, http.StatusNoContent); err != nil {
+		return err
+	}
+
+	const getMethod, getPath = http.MethodGet, "/motivation"
+	survivorSeen := false
+	for attempt := 1; attempt <= attempts; attempt++ {
+		resp, body, err := doRequest(ctx, env, getMethod, getPath, nil)
+		if err != nil {
+			return err
+		}
+		if err := assertStatus(getMethod, getPath, resp.StatusCode, http.StatusOK); err != nil {
+			return err
+		}
+		got := string(body)
+		switch got {
+		case toDelete:
+			return fmt.Errorf("%s %s: attempt %d returned deleted motivation %q; eviction from rotation regressed",
+				getMethod, getPath, attempt, got)
+		case survivor:
+			survivorSeen = true
+		default:
+			return fmt.Errorf("%s %s: attempt %d returned unexpected body %q; expected %q",
+				getMethod, getPath, attempt, got, survivor)
+		}
+	}
+	if !survivorSeen {
+		return fmt.Errorf("%s %s: surviving motivation %q not observed after %d attempts",
+			getMethod, getPath, survivor, attempts)
+	}
+	return nil
+}
+
 // buildExistingServiceSuite returns the ordered list of checks for
 // existing-service mode. Selection (selectChecks) automatically drops
 // destructive entries; render-required checks would also need a
@@ -923,6 +1308,8 @@ func buildExistingServiceSuite() []Check {
 		checkWhitespacePOSTRejected(),                 // T9
 		checkUnsupportedMethods(),                     // T11
 		checkUnknownRoute(),                           // T12
+		checkDeleteUnknownID(),                        // T24
+		checkDeleteInvalidID(),                        // T25
 		checkSubmittedMotivationRetrievableExisting(), // T14-existing
 	}
 }
@@ -1011,20 +1398,30 @@ func newFailingRender(status int) (*httptest.Server, string) {
 //
 // Ordering rationale:
 //
-//   - Group A: empty-DB and PNG-empty-DB assertions before any
-//     state-mutating POST; T15 is the sole mutating POST and must
+//   - Group A: empty-DB, PNG-empty-DB, and empty-list assertions before
+//     any state-mutating POST; T15 is the sole mutating POST and must
 //     therefore be last so its GET equality check sees a single entry.
 //   - Group B: T14-isolated needs a single-entry DB after its own POST.
-//   - Group C: T10 (validate POST) and T18 (PNG render success) both
+//   - Group C: T23 needs a single-entry DB after its own POST, just
+//     like T14-isolated, so it gets its own group rather than sharing
+//     group B (two POSTs in one DB would break both checks' "exactly
+//     one entry" assertions).
+//   - Group D: T10 (validate POST) and T18 (PNG render success) both
 //     work in a shared DB because neither asserts that the queue
 //     contains only their submissions. T10 runs first to keep
 //     diagnostic output predictable; T18's POST then PNG fetch is
 //     unaffected by T10's entry.
-//   - Group D: T16 requires a fresh DB because it asserts every GET
+//   - Group E: T16 requires a fresh DB because it asserts every GET
 //     returns one of its three submissions.
-//   - Group E: T17 has the same isolation requirement as T16.
-//   - Group F: render service unreachable.
-//   - Group G: render service returns 500.
+//   - Group F: T17 has the same isolation requirement as T16.
+//   - Group G: T26 requires a fresh DB because it asserts an exact
+//     count of entries before and after the delete.
+//   - Group H: T27 requires a fresh DB (solo state) because it asserts
+//     every GET /motivation response is one of exactly two submissions
+//     minus the deleted one; any other motivation sharing the database
+//     would make that assertion non-deterministic.
+//   - Group I: render service unreachable.
+//   - Group J: render service returns 500.
 func buildSelfManagedGroups() []selfManagedGroup {
 	return []selfManagedGroup{
 		{
@@ -1037,6 +1434,7 @@ func buildSelfManagedGroups() []selfManagedGroup {
 				checkUnknownRoute(),              // T12
 				checkEmptyMotivationCollection(), // T13 (pre-POST)
 				checkPNGNoMotivations(),          // T19 (pre-POST)
+				checkMotivationsListEmpty(),      // T22 (pre-POST)
 				checkTrimmedSubmission(),         // T15 (first POST)
 			},
 			setup: fakeRenderSuccessSetup,
@@ -1049,7 +1447,14 @@ func buildSelfManagedGroups() []selfManagedGroup {
 			setup: fakeRenderSuccessSetup,
 		},
 		{
-			name: "C-fake-render-valid-post-and-png",
+			name: "C-fake-render-list-after-post",
+			checks: []Check{
+				checkMotivationsListAfterPost(), // T23 (needs solo state)
+			},
+			setup: fakeRenderSuccessSetup,
+		},
+		{
+			name: "D-fake-render-valid-post-and-png",
 			checks: []Check{
 				checkValidPOSTAccepted(), // T10
 				checkPNGRenderSuccess(),  // T18
@@ -1057,26 +1462,40 @@ func buildSelfManagedGroups() []selfManagedGroup {
 			setup: fakeRenderSuccessSetup,
 		},
 		{
-			name: "D-fake-render-multiple-retrievable",
+			name: "E-fake-render-multiple-retrievable",
 			checks: []Check{
 				checkMultipleMotivationsRetrievable(), // T16 (needs solo state)
 			},
 			setup: fakeRenderSuccessSetup,
 		},
 		{
-			name: "E-fake-render-repeated-availability",
+			name: "F-fake-render-repeated-availability",
 			checks: []Check{
 				checkRepeatedGETAvailability(), // T17 (needs solo state)
 			},
 			setup: fakeRenderSuccessSetup,
 		},
 		{
-			name:   "F-render-unreachable",
+			name: "G-fake-render-delete-removes-from-list",
+			checks: []Check{
+				checkDeleteRemovesFromList(), // T26 (needs solo state)
+			},
+			setup: fakeRenderSuccessSetup,
+		},
+		{
+			name: "H-fake-render-deleted-not-served",
+			checks: []Check{
+				checkDeletedMotivationNotServed(), // T27 (needs solo state)
+			},
+			setup: fakeRenderSuccessSetup,
+		},
+		{
+			name:   "I-render-unreachable",
 			checks: []Check{checkRenderServiceUnreachable()}, // T20
 			setup:  unreachableRenderSetup,
 		},
 		{
-			name:   "G-render-non-ok",
+			name:   "J-render-non-ok",
 			checks: []Check{checkRenderServiceNonOK()}, // T21
 			setup:  failingRenderSetup(http.StatusInternalServerError),
 		},
