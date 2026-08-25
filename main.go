@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -161,10 +162,14 @@ func main() {
 			"Endpoints:\n"+
 			"GET /motivation - Get a random motivation\n"+
 			"POST /motivation - Add a new motivation (send motivation text in request body)\n"+
+			"GET /motivations - List all motivations\n"+
+			"DELETE /motivation/:id - Delete a motivation by id\n"+
 			"GET /motivations.png - Get a random motivation as an image")
 	})
 	e.GET("/motivation", getMotivation)
 	e.POST("/motivation", postMotivation)
+	e.GET("/motivations", listMotivations)
+	e.DELETE("/motivation/:id", deleteMotivation)
 	e.GET("/motivations.png", getMotivationPNG)
 
 	// Graceful shutdown
@@ -261,4 +266,46 @@ func getMotivationPNG(c echo.Context) error {
 
 	// Return the image data with appropriate content type
 	return c.Blob(http.StatusOK, "image/png", imageData)
+}
+
+// listMotivations returns every motivation stored in the database as JSON.
+func listMotivations(c echo.Context) error {
+	database := c.Get("db").(*db.DB)
+
+	motivations, err := database.GetAll()
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "Error retrieving motivations")
+	}
+
+	// GetAll returns nil (not an empty slice) when there are no rows, and
+	// c.JSON marshals a nil slice as `null` rather than `[]`.
+	if motivations == nil {
+		motivations = make([]db.Motivation, 0)
+	}
+
+	return c.JSON(http.StatusOK, motivations)
+}
+
+// deleteMotivation removes a motivation by id from the database and, on
+// success, evicts it from the in-memory queue so it stops being served.
+func deleteMotivation(c echo.Context) error {
+	database := c.Get("db").(*db.DB)
+	queue := c.Get("queue").(*MotivationQueue)
+
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		return c.String(http.StatusBadRequest, "Invalid motivation id")
+	}
+
+	deleted, err := database.Delete(id)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "Error deleting motivation")
+	}
+	if !deleted {
+		return c.String(http.StatusNotFound, "Motivation not found")
+	}
+
+	queue.Remove(id)
+
+	return c.NoContent(http.StatusNoContent)
 }
