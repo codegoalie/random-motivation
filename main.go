@@ -19,9 +19,16 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 )
 
+// queueEntry pairs a motivation's database id with its text so the queue
+// can locate and remove a specific motivation.
+type queueEntry struct {
+	id   int64
+	text string
+}
+
 // MotivationQueue holds a shuffled list of motivations and the current position
 type MotivationQueue struct {
-	motivations []string
+	motivations []queueEntry
 	currentPos  int
 	mu          sync.Mutex
 }
@@ -38,31 +45,63 @@ func (mq *MotivationQueue) Next() (string, error) {
 	motivation := mq.motivations[mq.currentPos]
 	mq.currentPos = (mq.currentPos + 1) % len(mq.motivations)
 
-	return motivation, nil
+	return motivation.text, nil
 }
 
 // Add appends a motivation to the end of the queue.
-func (mq *MotivationQueue) Add(motivation string) {
+func (mq *MotivationQueue) Add(id int64, text string) {
 	mq.mu.Lock()
 	defer mq.mu.Unlock()
 
-	mq.motivations = append(mq.motivations, motivation)
+	mq.motivations = append(mq.motivations, queueEntry{id: id, text: text})
+}
+
+// Remove deletes the entry with the given id from the queue, keeping
+// currentPos valid. It returns whether an entry was removed.
+func (mq *MotivationQueue) Remove(id int64) bool {
+	mq.mu.Lock()
+	defer mq.mu.Unlock()
+
+	index := -1
+	for i, entry := range mq.motivations {
+		if entry.id == id {
+			index = i
+			break
+		}
+	}
+	if index == -1 {
+		return false
+	}
+
+	mq.motivations = append(mq.motivations[:index], mq.motivations[index+1:]...)
+
+	if index < mq.currentPos {
+		mq.currentPos--
+	}
+
+	if len(mq.motivations) == 0 {
+		mq.currentPos = 0
+	} else {
+		mq.currentPos = ((mq.currentPos % len(mq.motivations)) + len(mq.motivations)) % len(mq.motivations)
+	}
+
+	return true
 }
 
 // NewMotivationQueue creates a new queue from a list of motivations and shuffles them
 func NewMotivationQueue(motivations []db.Motivation) *MotivationQueue {
-	texts := make([]string, len(motivations))
+	entries := make([]queueEntry, len(motivations))
 	for i, m := range motivations {
-		texts[i] = m.Text
+		entries[i] = queueEntry{id: m.ID, text: m.Text}
 	}
 
 	// Shuffle the list
-	rand.Shuffle(len(texts), func(i, j int) {
-		texts[i], texts[j] = texts[j], texts[i]
+	rand.Shuffle(len(entries), func(i, j int) {
+		entries[i], entries[j] = entries[j], entries[i]
 	})
 
 	return &MotivationQueue{
-		motivations: texts,
+		motivations: entries,
 		currentPos:  0,
 	}
 }
@@ -175,11 +214,11 @@ func postMotivation(c echo.Context) error {
 	}
 
 	// Insert into database
-	_, err = database.Insert(motivation)
+	id, err := database.Insert(motivation)
 	if err != nil {
 		return c.String(http.StatusInternalServerError, "Error saving motivation")
 	}
-	queue.Add(motivation)
+	queue.Add(id, motivation)
 
 	return c.String(http.StatusCreated, "Motivation added successfully")
 }
