@@ -7,9 +7,9 @@ import (
 
 // Motivation represents a motivational quote
 type Motivation struct {
-	ID        int64
-	Text      string
-	CreatedAt string
+	ID        int64  `json:"id"`
+	Text      string `json:"text"`
+	CreatedAt string `json:"created_at"`
 }
 
 // MotivationRepository defines the interface for motivation data access
