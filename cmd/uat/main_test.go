@@ -1562,44 +1562,148 @@ func TestCheckTrimmedSubmission_FailsOnWrongPOSTStatus(t *testing.T) {
 	}
 }
 
-func TestCheckSubmittedMotivationRetrievableExisting_PassesWhenSubmittedTextAppears(t *testing.T) {
-	var stashed string
-	var gets atomic.Int32
+// fakeRotationState models the deployed service's fixed-order
+// MotivationQueue for tests: GET /motivation walks entries in
+// insertion order and wraps around; POST appends a new entry to the
+// end of that order without reshuffling; DELETE removes an entry from
+// both the backing list and the rotation (matching the real service's
+// documented eviction-on-delete behavior).
+type fakeRotationState struct {
+	mu         sync.Mutex
+	items      []motivationListItem
+	nextID     int64
+	cursor     int
+	deletedIDs []int64
+}
+
+// newFakeRotationServer starts an httptest.Server backed by a
+// fakeRotationState pre-seeded with seedCount entries (texts
+// "seed-0".."seed-N"), and returns both the server and the state so
+// tests can inspect it after a check runs (e.g. to confirm cleanup).
+func newFakeRotationServer(t *testing.T, seedCount int) (*httptest.Server, *fakeRotationState) {
+	t.Helper()
+	state := &fakeRotationState{}
+	for i := 0; i < seedCount; i++ {
+		state.nextID++
+		state.items = append(state.items, motivationListItem{
+			ID:        state.nextID,
+			Text:      fmt.Sprintf("seed-%d", i),
+			CreatedAt: "2024-01-01T00:00:00Z",
+		})
+	}
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		state.mu.Lock()
+		defer state.mu.Unlock()
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			b, err := json.Marshal(state.items)
+			if err != nil {
+				t.Fatalf("marshal fake motivations list: %v", err)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(b)
 		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
-			b, _ := io.ReadAll(r.Body)
-			stashed = string(b)
+			body, _ := io.ReadAll(r.Body)
+			state.nextID++
+			state.items = append(state.items, motivationListItem{
+				ID:        state.nextID,
+				Text:      strings.TrimSpace(string(body)),
+				CreatedAt: "2024-01-01T00:00:00Z",
+			})
 			w.WriteHeader(http.StatusCreated)
 			_, _ = io.WriteString(w, "Motivation added successfully")
 		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
-			n := gets.Add(1)
-			w.WriteHeader(http.StatusOK)
-			if n >= 3 {
-				_, _ = io.WriteString(w, stashed)
+			if len(state.items) == 0 {
+				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			_, _ = io.WriteString(w, "another motivation")
+			item := state.items[state.cursor%len(state.items)]
+			state.cursor++
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, item.Text)
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/motivation/"):
+			idStr := strings.TrimPrefix(r.URL.Path, "/motivation/")
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			idx := -1
+			for i, item := range state.items {
+				if item.ID == id {
+					idx = i
+					break
+				}
+			}
+			if idx == -1 {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			state.deletedIDs = append(state.deletedIDs, id)
+			state.items = append(state.items[:idx], state.items[idx+1:]...)
+			if state.cursor > idx {
+				state.cursor--
+			}
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 		}
 	})
 	srv := httptest.NewServer(h)
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	return srv, state
+}
+
+func TestRunRetrievableExisting_PassesAndCleansUpWithCorrectID(t *testing.T) {
+	srv, state := newFakeRotationServer(t, 0)
 
 	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
 	env.RunID = "test-run-existing"
-	// Use the parameterized helper with a short sleep to keep the test fast.
-	if err := runRetrievableExisting(context.Background(), env, 5, time.Millisecond); err != nil {
+	if err := runRetrievableExisting(context.Background(), env, 4, time.Millisecond); err != nil {
 		t.Fatalf("expected nil, got %v", err)
 	}
-	want := "uat-retrievable-existing-" + env.RunID
-	if stashed != want {
-		t.Errorf("emulated app stashed %q, want %q", stashed, want)
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.items) != 0 {
+		t.Errorf("expected empty collection after cleanup, got %d entries: %+v", len(state.items), state.items)
 	}
-	if got := gets.Load(); got < 3 {
-		t.Errorf("expected at least 3 GET attempts, got %d", got)
+	if len(state.deletedIDs) != 1 {
+		t.Fatalf("expected exactly one cleanup DELETE, got %d", len(state.deletedIDs))
+	}
+	if state.deletedIDs[0] != 1 {
+		t.Errorf("cleanup DELETE used id=%d, want the id assigned to the posted motivation (1)", state.deletedIDs[0])
+	}
+}
+
+// TestRunRetrievableExisting_RegressionLargeCollectionWorstCasePosition is
+// the regression test for the fixed-rotation bug: with 25 pre-existing
+// entries, the posted motivation is appended at index 25 (the last slot
+// of a 26-entry rotation), and with the rotation cursor starting at 0 it
+// is only served on the 26th GET /motivation call. The old hardcoded
+// budget of 20 attempts could never observe it here and would fail
+// against this perfectly healthy setup; the derived n+1 budget (25+1=26,
+// plus safetyBuffer=0 to pin the exact boundary) must succeed.
+func TestRunRetrievableExisting_RegressionLargeCollectionWorstCasePosition(t *testing.T) {
+	srv, state := newFakeRotationServer(t, 25)
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-existing-large"
+	if err := runRetrievableExisting(context.Background(), env, 0, time.Millisecond); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.items) != 25 {
+		t.Errorf("expected 25 entries after cleanup, got %d: %+v", len(state.items), state.items)
+	}
+	want := "uat-retrievable-existing-" + env.RunID
+	for _, item := range state.items {
+		if item.Text == want {
+			t.Errorf("cleanup did not delete %q", want)
+		}
 	}
 }
 
@@ -1610,15 +1714,42 @@ func TestCheckSubmittedMotivationRetrievableExisting_TaggedNonDestructive(t *tes
 	}
 }
 
-func TestCheckSubmittedMotivationRetrievableExisting_FailsWhenSubmittedTextNeverAppears(t *testing.T) {
+func TestRunRetrievableExisting_FailsWhenSubmittedTextNeverAppearsButCleansUpAnyway(t *testing.T) {
+	var mu sync.Mutex
+	var items []motivationListItem
+	var nextID int64
+	var deletedIDs []int64
+
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			b, _ := json.Marshal(items)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(b)
 		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			body, _ := io.ReadAll(r.Body)
+			nextID++
+			items = append(items, motivationListItem{
+				ID: nextID, Text: strings.TrimSpace(string(body)), CreatedAt: "2024-01-01T00:00:00Z",
+			})
 			w.WriteHeader(http.StatusCreated)
 			_, _ = io.WriteString(w, "Motivation added successfully")
 		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, "never the submitted text")
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/motivation/"):
+			idStr := strings.TrimPrefix(r.URL.Path, "/motivation/")
+			id, _ := strconv.ParseInt(idStr, 10, 64)
+			deletedIDs = append(deletedIDs, id)
+			for i, it := range items {
+				if it.ID == id {
+					items = append(items[:i], items[i+1:]...)
+					break
+				}
+			}
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
@@ -1628,13 +1759,138 @@ func TestCheckSubmittedMotivationRetrievableExisting_FailsWhenSubmittedTextNever
 
 	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
 	env.RunID = "test-run-existing-fail"
-	err := runRetrievableExisting(context.Background(), env, 3, time.Millisecond)
+	// n=0 before POST, safetyBuffer=2 -> attempts = 0+1+2 = 3.
+	err := runRetrievableExisting(context.Background(), env, 2, time.Millisecond)
 	if err == nil {
 		t.Fatal("expected error")
 	}
 	msg := err.Error()
 	want := "uat-retrievable-existing-" + env.RunID
 	for _, sub := range []string{"GET", "/motivation", want, "3 attempts"} {
+		if !strings.Contains(msg, sub) {
+			t.Errorf("expected error to mention %q, got: %s", sub, msg)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deletedIDs) != 1 {
+		t.Fatalf("expected cleanup DELETE to fire exactly once even on poll failure, got %d", len(deletedIDs))
+	}
+	if len(items) != 0 {
+		t.Errorf("expected cleanup to remove the row, got %d remaining: %+v", len(items), items)
+	}
+}
+
+func TestRunRetrievableExisting_FailsWhenInitialMotivationsListFails(t *testing.T) {
+	var postCalled bool
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusInternalServerError)
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			postCalled = true
+			w.WriteHeader(http.StatusCreated)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-list-fail"
+	err := runRetrievableExisting(context.Background(), env, 2, time.Millisecond)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "/motivations") {
+		t.Errorf("expected error to mention /motivations, got: %s", err.Error())
+	}
+	if postCalled {
+		t.Error("expected POST /motivation to never be called when the initial GET /motivations fails")
+	}
+}
+
+func TestRunRetrievableExisting_CleanupFailureSurfacedWhenPollSucceeds(t *testing.T) {
+	var posted bool
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			if posted {
+				_, _ = io.WriteString(w, `[{"id":1,"text":"uat-retrievable-existing-test-run-cleanup-fail","created_at":"2024-01-01T00:00:00Z"}]`)
+				return
+			}
+			_, _ = io.WriteString(w, "[]")
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			posted = true
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "uat-retrievable-existing-test-run-cleanup-fail")
+		case r.Method == http.MethodDelete && r.URL.Path == "/motivation/1":
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-cleanup-fail"
+	err := runRetrievableExisting(context.Background(), env, 2, time.Millisecond)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, sub := range []string{"cleanup", "500"} {
+		if !strings.Contains(msg, sub) {
+			t.Errorf("expected error to mention %q, got: %s", sub, msg)
+		}
+	}
+	// The poll itself succeeded (the payload was observed), so the
+	// surfaced error must be purely about the cleanup failure, not a
+	// poll-not-observed message masking it or being masked by it.
+	if strings.Contains(msg, "not observed") {
+		t.Errorf("expected pure cleanup failure language, got poll-failure language too: %s", msg)
+	}
+}
+
+func TestRunRetrievableExisting_PollAndCleanupBothFail(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `[{"id":1,"text":"uat-retrievable-existing-test-run-both-fail","created_at":"2024-01-01T00:00:00Z"}]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "never matches")
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-both-fail"
+	err := runRetrievableExisting(context.Background(), env, 0, time.Millisecond)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	// Both failures must be visible: the poll failure is the primary,
+	// actionable error and must not be replaced by the cleanup failure,
+	// but the cleanup failure must not be silently dropped either.
+	for _, sub := range []string{"not observed", "cleanup failed", "500"} {
 		if !strings.Contains(msg, sub) {
 			t.Errorf("expected error to mention %q, got: %s", sub, msg)
 		}

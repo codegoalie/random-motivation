@@ -384,11 +384,15 @@ func checkValidPOSTAccepted() Check {
 	}
 }
 
-// retrievableExistingDefaultAttempts is the maximum number of GET
-// /motivation attempts checkSubmittedMotivationRetrievableExisting
-// makes while waiting for its submitted text to appear. The default
-// matches the UAT specification's "bounded number of GET attempts".
-const retrievableExistingDefaultAttempts = 20
+// retrievableExistingDefaultSafetyBuffer is added on top of the
+// mathematically-required N+1 attempt budget that runRetrievableExisting
+// derives from the collection size it observes via GET /motivations
+// (see the comment on that derivation for the underlying arithmetic).
+// The buffer exists to absorb a modest amount of concurrent traffic on
+// a live service -- other clients POSTing or GETing during the poll
+// can grow the rotation or advance its cursor out from under a bare
+// N+1 budget -- without materially lengthening the worst-case runtime.
+const retrievableExistingDefaultSafetyBuffer = 5
 
 // retrievableExistingDefaultSleep is the pause between consecutive
 // GET attempts in checkSubmittedMotivationRetrievableExisting. It is
@@ -469,20 +473,21 @@ func checkTrimmedSubmission() Check {
 }
 
 // checkSubmittedMotivationRetrievableExisting submits a unique
-// motivation via POST /motivation, then polls GET /motivation up to
-// retrievableExistingDefaultAttempts times (sleeping
-// retrievableExistingDefaultSleep between attempts) until the response
-// body equals the submitted text. Tagged nonDestructive: the check
-// does add a motivation to the remote database, but the UAT
-// specification wants it eligible against existing services so
-// operators opt into that single mutation by including the check.
+// motivation via POST /motivation, polls GET /motivation until the
+// response body equals the submitted text, and then deletes the row
+// it created via DELETE /motivation/:id. The attempt budget is
+// derived from the collection size observed via GET /motivations
+// before the POST -- see runRetrievableExisting for the arithmetic.
+// Tagged nonDestructive: the POST and the DELETE cleanup net out to
+// no permanent state change, so the check is safe to run against any
+// reachable instance, including a live deployed service.
 func checkSubmittedMotivationRetrievableExisting() Check {
 	return Check{
 		Name: "submitted motivation is eventually retrievable (existing service)",
 		Kind: nonDestructive,
 		Run: func(ctx context.Context, env *Env) error {
 			return runRetrievableExisting(ctx, env,
-				retrievableExistingDefaultAttempts,
+				retrievableExistingDefaultSafetyBuffer,
 				retrievableExistingDefaultSleep)
 		},
 	}
@@ -490,9 +495,38 @@ func checkSubmittedMotivationRetrievableExisting() Check {
 
 // runRetrievableExisting implements the body of
 // checkSubmittedMotivationRetrievableExisting with a configurable
-// attempt budget and sleep so tests can exercise the failure path
+// safety buffer and sleep so tests can exercise the failure paths
 // without waiting for the production-tuned defaults.
-func runRetrievableExisting(ctx context.Context, env *Env, attempts int, sleep time.Duration) error {
+//
+// It first learns the current collection size N via GET /motivations,
+// then POSTs the unique test motivation, then polls GET /motivation
+// for it, and finally -- regardless of whether the poll succeeded --
+// deletes the row it created (matched by its unique text via
+// GET /motivations) so the check leaves the target database exactly
+// as it found it.
+//
+// Error precedence: the poll's outcome is what this check exists to
+// verify, so a poll failure is the primary returned error. Cleanup
+// still always runs (via defer) so a failing run never leaves a stray
+// row behind, but a cleanup failure must not silently replace a real
+// poll failure -- it is appended to it instead. If the poll succeeded
+// but cleanup failed, the cleanup failure becomes the returned error
+// on its own, since leaving a stray row is itself a real problem.
+func runRetrievableExisting(ctx context.Context, env *Env, safetyBuffer int, sleep time.Duration) (retErr error) {
+	const listMethod, listPath = http.MethodGet, "/motivations"
+	listResp, listBody, err := doRequest(ctx, env, listMethod, listPath, nil)
+	if err != nil {
+		return err
+	}
+	if err := assertStatus(listMethod, listPath, listResp.StatusCode, http.StatusOK); err != nil {
+		return err
+	}
+	before, err := decodeMotivationList(listBody)
+	if err != nil {
+		return err
+	}
+	n := len(before)
+
 	const postMethod, postPath = http.MethodPost, "/motivation"
 	payload := "uat-retrievable-existing-" + env.RunID
 	postResp, _, err := doRequest(ctx, env, postMethod, postPath, strings.NewReader(payload))
@@ -503,28 +537,103 @@ func runRetrievableExisting(ctx context.Context, env *Env, attempts int, sleep t
 		return err
 	}
 
+	// From this point on the target database holds our test row, so
+	// every remaining exit path -- success, poll failure, or context
+	// cancellation -- must attempt cleanup. See the error-precedence
+	// note on the doc comment above for how cleanupErr is merged into
+	// the return value.
+	defer func() {
+		cleanupErr := deleteMotivationByText(ctx, env, payload)
+		if cleanupErr == nil {
+			return
+		}
+		if retErr != nil {
+			retErr = fmt.Errorf("%w (additionally, cleanup failed: %v)", retErr, cleanupErr)
+			return
+		}
+		retErr = fmt.Errorf("cleanup after successful poll failed: %w", cleanupErr)
+	}()
+
+	// The service's MotivationQueue is a fixed-order rotation, shuffled
+	// once at startup; Add appends new entries to the END of that
+	// rotation rather than reshuffling. After the POST above the
+	// rotation holds n+1 entries with ours in the last slot, and
+	// GET /motivation walks the rotation in order, wrapping around. In
+	// the worst case (the cursor has just passed our slot) it takes a
+	// full cycle -- n+1 GETs -- before our entry is served again, so
+	// n+1 is the minimum budget that guarantees observation.
+	// safetyBuffer adds a small margin on top of that for concurrent
+	// traffic against a live service.
+	attempts := n + 1 + safetyBuffer
+
 	const getMethod, getPath = http.MethodGet, "/motivation"
 	for i := range attempts {
 		if i > 0 {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				retErr = ctx.Err()
+				return retErr
 			case <-time.After(sleep):
 			}
 		}
 		getResp, getBody, err := doRequest(ctx, env, getMethod, getPath, nil)
 		if err != nil {
-			return err
+			retErr = err
+			return retErr
 		}
 		if err := assertStatus(getMethod, getPath, getResp.StatusCode, http.StatusOK); err != nil {
-			return err
+			retErr = err
+			return retErr
 		}
 		if string(getBody) == payload {
 			return nil
 		}
 	}
-	return fmt.Errorf("%s %s: submitted motivation %q not observed after %d attempts",
-		getMethod, getPath, payload, attempts)
+	retErr = fmt.Errorf("%s %s: submitted motivation %q not observed after %d attempts (collection size before POST=%d)",
+		getMethod, getPath, payload, attempts, n)
+	return retErr
+}
+
+// deleteMotivationByText locates the motivation whose text equals
+// payload via GET /motivations and deletes it via
+// DELETE /motivation/:id, asserting a 204 No Content response. It is
+// used by runRetrievableExisting to clean up the test row it creates,
+// keeping that check's effect on the target database net-zero.
+func deleteMotivationByText(ctx context.Context, env *Env, payload string) error {
+	const listMethod, listPath = http.MethodGet, "/motivations"
+	listResp, listBody, err := doRequest(ctx, env, listMethod, listPath, nil)
+	if err != nil {
+		return fmt.Errorf("cleanup: %w", err)
+	}
+	if err := assertStatus(listMethod, listPath, listResp.StatusCode, http.StatusOK); err != nil {
+		return fmt.Errorf("cleanup: %w", err)
+	}
+	items, err := decodeMotivationList(listBody)
+	if err != nil {
+		return fmt.Errorf("cleanup: %w", err)
+	}
+	var id int64
+	for _, item := range items {
+		if item.Text == payload {
+			id = item.ID
+			break
+		}
+	}
+	if id == 0 {
+		return fmt.Errorf("cleanup: could not locate submitted entry %q to delete (body=%q)",
+			payload, string(listBody))
+	}
+
+	const deleteMethod = http.MethodDelete
+	deletePath := fmt.Sprintf("/motivation/%d", id)
+	delResp, _, err := doRequest(ctx, env, deleteMethod, deletePath, nil)
+	if err != nil {
+		return fmt.Errorf("cleanup: %w", err)
+	}
+	if err := assertStatus(deleteMethod, deletePath, delResp.StatusCode, http.StatusNoContent); err != nil {
+		return fmt.Errorf("cleanup: %w", err)
+	}
+	return nil
 }
 
 // multipleRetrievableSubmissions is the number of unique motivations
