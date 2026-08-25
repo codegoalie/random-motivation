@@ -384,6 +384,22 @@ func checkValidPOSTAccepted() Check {
 	}
 }
 
+// cleanupContextTimeout bounds the deferred cleanup call in
+// runRetrievableExisting (the DELETE that removes the test row its POST
+// created). Cleanup deliberately does NOT share the run's own
+// ctx/deadline: by the time cleanup runs, the target database already
+// holds our test row, so cleanup must still be attempted even if the
+// run's context has been cancelled or its deadline has already elapsed
+// (the real-world trigger is --timeout expiring mid-poll against a live
+// service). Reusing a dead context there would make cleanup's own
+// GET /motivations and DELETE /motivation/:id calls fail immediately,
+// leaving a stray uat-* row in the target database permanently -- the
+// exact leak this constant exists to prevent. Cleanup gets its own
+// short, bounded budget instead: long enough for two fast HTTP calls,
+// short enough that a run which is already shutting down is never held
+// open indefinitely by an unresponsive server.
+const cleanupContextTimeout = 3 * time.Second
+
 // retrievableExistingDefaultSafetyBuffer is added on top of the
 // mathematically-required N+1 attempt budget that runRetrievableExisting
 // derives from the collection size it observes via GET /motivations
@@ -542,8 +558,19 @@ func runRetrievableExisting(ctx context.Context, env *Env, safetyBuffer int, sle
 	// cancellation -- must attempt cleanup. See the error-precedence
 	// note on the doc comment above for how cleanupErr is merged into
 	// the return value.
+	//
+	// Cleanup is given its own context rather than reusing ctx: this is
+	// the one call site that knows cleanup must outlive the run's own
+	// cancellation/deadline (see cleanupContextTimeout), so the decision
+	// to detach belongs here rather than inside deleteMotivationByText
+	// itself. Keeping that helper an ordinary ctx-respecting function
+	// means it behaves honestly if anything else ever calls it outside
+	// a cleanup path, and it stays trivially testable with a plain
+	// context.Context of the caller's choosing.
 	defer func() {
-		cleanupErr := deleteMotivationByText(ctx, env, payload)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupContextTimeout)
+		defer cancel()
+		cleanupErr := deleteMotivationByText(cleanupCtx, env, payload)
 		if cleanupErr == nil {
 			return
 		}

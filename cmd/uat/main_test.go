@@ -1897,6 +1897,244 @@ func TestRunRetrievableExisting_PollAndCleanupBothFail(t *testing.T) {
 	}
 }
 
+// TestRunRetrievableExisting_CleanupSurvivesParentContextCancellation is
+// the regression test for the leak described in random-motivation-67z:
+// runRetrievableExisting's deferred cleanup used to share the run's own
+// ctx, so once that ctx was cancelled (the real trigger is --timeout
+// expiring mid-poll against a live service) the cleanup's own
+// GET /motivations and DELETE /motivation/:id calls failed immediately,
+// leaving the uat-* test row permanently in the target database. This
+// test cancels the parent context from inside the fake server's first
+// GET /motivation handler -- guaranteeing the cancellation happens only
+// after the POST has already completed successfully on the client side,
+// exactly matching the real-world sequence -- and asserts the DELETE
+// still reaches the server and the row is actually gone.
+func TestRunRetrievableExisting_CleanupSurvivesParentContextCancellation(t *testing.T) {
+	var mu sync.Mutex
+	var items []motivationListItem
+	var nextID int64
+	var deletedIDs []int64
+	var cancelled bool
+
+	var cancel context.CancelFunc
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			b, _ := json.Marshal(items)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(b)
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			body, _ := io.ReadAll(r.Body)
+			nextID++
+			items = append(items, motivationListItem{
+				ID: nextID, Text: strings.TrimSpace(string(body)), CreatedAt: "2024-01-01T00:00:00Z",
+			})
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			// The POST above has already completed on the client side by
+			// the time any GET /motivation request reaches us -- cancel
+			// the run's context here, mid-poll, exactly as a real
+			// --timeout expiry would.
+			if !cancelled {
+				cancelled = true
+				cancel()
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "never matches")
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/motivation/"):
+			idStr := strings.TrimPrefix(r.URL.Path, "/motivation/")
+			id, _ := strconv.ParseInt(idStr, 10, 64)
+			for i, it := range items {
+				if it.ID == id {
+					items = append(items[:i], items[i+1:]...)
+					break
+				}
+			}
+			deletedIDs = append(deletedIDs, id)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancelFn := context.WithCancel(context.Background())
+	cancel = cancelFn
+	defer cancelFn()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-ctx-cancel"
+	err := runRetrievableExisting(ctx, env, 3, time.Millisecond)
+	if err == nil {
+		t.Fatal("expected an error because the parent context was cancelled mid-poll")
+	}
+	if !strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("expected the returned error to report the underlying cancellation, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "cleanup failed") || strings.Contains(err.Error(), "cleanup after") {
+		t.Errorf("cleanup succeeded, so it must not be reported as a failure: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deletedIDs) != 1 {
+		t.Fatalf("expected exactly one cleanup DELETE to reach the server despite parent cancellation, got %d", len(deletedIDs))
+	}
+	if len(items) != 0 {
+		t.Errorf("expected the test row to be removed despite parent cancellation, got %d remaining: %+v", len(items), items)
+	}
+}
+
+// TestRunRetrievableExisting_CleanupSurvivesParentContextDeadlineExceeded
+// mirrors TestRunRetrievableExisting_CleanupSurvivesParentContextCancellation
+// but kills the parent context via a naturally-expiring deadline instead
+// of an explicit cancel() call, since that is the actual mechanism the
+// --timeout flag uses in production. The fake server's first
+// GET /motivation handler sleeps well past the deadline before
+// responding, guaranteeing the deadline has elapsed by the time the
+// client observes it, while the POST beforehand completes comfortably
+// within the deadline.
+func TestRunRetrievableExisting_CleanupSurvivesParentContextDeadlineExceeded(t *testing.T) {
+	var mu sync.Mutex
+	var items []motivationListItem
+	var nextID int64
+	var deletedIDs []int64
+
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			mu.Lock()
+			b, _ := json.Marshal(items)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(b)
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			nextID++
+			items = append(items, motivationListItem{
+				ID: nextID, Text: strings.TrimSpace(string(body)), CreatedAt: "2024-01-01T00:00:00Z",
+			})
+			mu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			// Sleep well past the parent's deadline before responding, so
+			// the client observes DeadlineExceeded rather than a normal
+			// (non-matching) response.
+			time.Sleep(100 * time.Millisecond)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "never matches")
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/motivation/"):
+			idStr := strings.TrimPrefix(r.URL.Path, "/motivation/")
+			id, _ := strconv.ParseInt(idStr, 10, 64)
+			mu.Lock()
+			for i, it := range items {
+				if it.ID == id {
+					items = append(items[:i], items[i+1:]...)
+					break
+				}
+			}
+			deletedIDs = append(deletedIDs, id)
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-ctx-deadline"
+	err := runRetrievableExisting(ctx, env, 3, time.Millisecond)
+	if err == nil {
+		t.Fatal("expected an error because the parent context's deadline elapsed mid-poll")
+	}
+	if !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Errorf("expected the returned error to report the underlying deadline, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "cleanup failed") || strings.Contains(err.Error(), "cleanup after") {
+		t.Errorf("cleanup succeeded, so it must not be reported as a failure: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deletedIDs) != 1 {
+		t.Fatalf("expected exactly one cleanup DELETE to reach the server despite the elapsed deadline, got %d", len(deletedIDs))
+	}
+	if len(items) != 0 {
+		t.Errorf("expected the test row to be removed despite the elapsed deadline, got %d remaining: %+v", len(items), items)
+	}
+}
+
+// TestRunRetrievableExisting_CleanupHasItsOwnBoundedTimeout confirms
+// cleanup does not inherit an unbounded lifetime just because it no
+// longer inherits the parent's cancellation: a server that hangs on the
+// cleanup DELETE must not hang the run forever. The poll succeeds
+// immediately so only the cleanup path is under test.
+func TestRunRetrievableExisting_CleanupHasItsOwnBoundedTimeout(t *testing.T) {
+	payload := "uat-retrievable-existing-test-run-cleanup-hangs"
+	done := make(chan struct{})
+
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `[{"id":1,"text":"`+payload+`","created_at":"2024-01-01T00:00:00Z"}]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, payload)
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/motivation/"):
+			// Hang well past any reasonable cleanup timeout. `done` is
+			// closed once the test has finished asserting, so this
+			// goroutine (and thus httptest.Server.Close, which waits for
+			// in-flight handlers) is never actually blocked forever.
+			select {
+			case <-time.After(30 * time.Second):
+			case <-done:
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	// Registered after srv.Close() so that, on unwind, defers run LIFO
+	// and close(done) fires FIRST -- unblocking the hanging handler
+	// goroutine before srv.Close() (which waits for in-flight handlers)
+	// tries to wait on it.
+	defer close(done)
+
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-cleanup-hangs"
+
+	start := time.Now()
+	err := runRetrievableExisting(context.Background(), env, 2, time.Millisecond)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an error because the cleanup DELETE never got a response in time")
+	}
+	if !strings.Contains(err.Error(), "cleanup after successful poll failed") {
+		t.Errorf("expected a pure cleanup-after-success failure (poll observed the payload), got: %v", err)
+	}
+	if elapsed >= 20*time.Second {
+		t.Errorf("cleanup must give up within its own small bounded timeout, took %s", elapsed)
+	}
+}
+
 func TestCheckMultipleMotivationsRetrievable_PassesWhenAllSubmittedTextsCycle(t *testing.T) {
 	var submitted []string
 	var gets atomic.Int32
