@@ -18,6 +18,7 @@ type MotivationRepository interface {
 	Insert(text string) (int64, error)
 	GetAll() ([]Motivation, error)
 	Count() (int, error)
+	Delete(id int64) (bool, error)
 }
 
 // GetRandom returns a random motivation from the database
@@ -94,4 +95,23 @@ func (db *DB) Count() (int, error) {
 		return 0, fmt.Errorf("failed to count motivations: %w", err)
 	}
 	return count, nil
+}
+
+// Delete removes a motivation by id. It returns false (with no error)
+// when no row matched the given id.
+func (db *DB) Delete(id int64) (bool, error) {
+	result, err := db.Exec(`
+		DELETE FROM motivations
+		WHERE id = ?
+	`, id)
+	if err != nil {
+		return false, fmt.Errorf("failed to delete motivation: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to delete motivation: %w", err)
+	}
+
+	return rowsAffected > 0, nil
 }
