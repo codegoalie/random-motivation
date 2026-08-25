@@ -2005,6 +2005,8 @@ func TestSelfManagedGroups_OrderingConstraints(t *testing.T) {
 		"whitespace motivation POST is rejected",
 		"unsupported methods are rejected with 405",
 		"unknown route returns 404",
+		"DELETE unknown motivation id returns 404",
+		"DELETE unparseable motivation id returns 400",
 		"empty motivation collection returns 404",
 		"empty motivation collection PNG returns 404",
 		"empty motivations list returns empty JSON array",
@@ -2029,6 +2031,25 @@ func TestSelfManagedGroups_OrderingConstraints(t *testing.T) {
 	if !(idxEmpty < idxTrimmed && idxPNGNone < idxTrimmed && idxListEmpty < idxTrimmed) {
 		t.Errorf("group A: empty/pngNone/listEmpty must precede trimmed POST; idxEmpty=%d idxPNGNone=%d idxListEmpty=%d idxTrimmed=%d",
 			idxEmpty, idxPNGNone, idxListEmpty, idxTrimmed)
+	}
+	// T24 and T25 are nonDestructive checks duplicated from the
+	// existing-service suite (see buildExistingServiceSuite) so they
+	// also run in self-managed/CI mode; they must be present in group A
+	// alongside the other nonDestructive checks (T11, T12) rather than
+	// only in existing-service mode, and (being stateless) must precede
+	// the trimmed-submission POST like the rest of group A's
+	// nonDestructive checks.
+	idxDeleteUnknown := indexOfName(gotA, "DELETE unknown motivation id returns 404")
+	idxDeleteInvalid := indexOfName(gotA, "DELETE unparseable motivation id returns 400")
+	if idxDeleteUnknown < 0 {
+		t.Errorf("group A: missing T24 (DELETE unknown motivation id returns 404)")
+	}
+	if idxDeleteInvalid < 0 {
+		t.Errorf("group A: missing T25 (DELETE unparseable motivation id returns 400)")
+	}
+	if !(idxDeleteUnknown < idxTrimmed && idxDeleteInvalid < idxTrimmed) {
+		t.Errorf("group A: T24/T25 must precede trimmed POST; idxDeleteUnknown=%d idxDeleteInvalid=%d idxTrimmed=%d",
+			idxDeleteUnknown, idxDeleteInvalid, idxTrimmed)
 	}
 
 	// Group B: T14-isolated alone (single-entry state).

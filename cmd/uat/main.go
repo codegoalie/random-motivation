@@ -1398,9 +1398,12 @@ func newFailingRender(status int) (*httptest.Server, string) {
 //
 // Ordering rationale:
 //
-//   - Group A: empty-DB, PNG-empty-DB, and empty-list assertions before
-//     any state-mutating POST; T15 is the sole mutating POST and must
-//     therefore be last so its GET equality check sees a single entry.
+//   - Group A: nonDestructive checks (T7-T12, T24, T25) are duplicated
+//     here from the existing-service suite so they also run in
+//     self-managed/CI mode, followed by empty-DB, PNG-empty-DB, and
+//     empty-list assertions before any state-mutating POST; T15 is the
+//     sole mutating POST and must therefore be last so its GET
+//     equality check sees a single entry.
 //   - Group B: T14-isolated needs a single-entry DB after its own POST.
 //   - Group C: T23 needs a single-entry DB after its own POST, just
 //     like T14-isolated, so it gets its own group rather than sharing
@@ -1432,6 +1435,8 @@ func buildSelfManagedGroups() []selfManagedGroup {
 				checkWhitespacePOSTRejected(),    // T9
 				checkUnsupportedMethods(),        // T11
 				checkUnknownRoute(),              // T12
+				checkDeleteUnknownID(),           // T24
+				checkDeleteInvalidID(),           // T25
 				checkEmptyMotivationCollection(), // T13 (pre-POST)
 				checkPNGNoMotivations(),          // T19 (pre-POST)
 				checkMotivationsListEmpty(),      // T22 (pre-POST)
