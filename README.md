@@ -58,6 +58,47 @@ http --raw "Your motivational quote here" POST localhost:8080/motivation
 - `400 Bad Request` - Empty motivation
 - `500 Internal Server Error` - Database error
 
+### List All Motivations
+
+```bash
+curl http://localhost:8080/motivations
+
+# Or with HTTPie
+http localhost:8080/motivations
+```
+
+**Response:** A JSON array of all motivations, newest first. Returns `[]` when there are none.
+
+```json
+[
+  {"id": 2, "text": "You can do it!", "created_at": "2026-08-25 10:00:00"},
+  {"id": 1, "text": "Believe in yourself.", "created_at": "2026-08-24 09:00:00"}
+]
+```
+
+**Status Codes:**
+
+- `200 OK` - Success (including an empty list)
+- `500 Internal Server Error` - Database error
+
+### Delete a Motivation
+
+```bash
+curl -X DELETE http://localhost:8080/motivation/1
+
+# Or with HTTPie
+http DELETE localhost:8080/motivation/1
+```
+
+**Response:** Empty body on success
+
+**Status Codes:**
+
+- `204 No Content` - Successfully deleted
+- `400 Bad Request` - `:id` is not a valid integer
+- `404 Not Found` - No motivation exists with that id
+- `500 Internal Server Error` - Database error
+
 ## Configuration
 
 Environment variables:

@@ -9,6 +9,8 @@ This is a Go REST API (`github.com/codegoalie/random-motivation`) that serves ra
 ### Features
 - **GET /motivation** - Returns a random motivational quote
 - **POST /motivation** - Adds a new motivational quote
+- **GET /motivations** - Lists all motivations
+- **DELETE /motivation/:id** - Deletes a motivation by id
 - Automatic migration from text file to SQLite on first run
 - Graceful shutdown with proper connection cleanup
 
@@ -31,6 +33,12 @@ curl http://localhost:8080/motivation
 
 # Add a new motivation
 curl -X POST -d "Your motivation here" http://localhost:8080/motivation
+
+# List all motivations
+curl http://localhost:8080/motivations
+
+# Delete a motivation by id
+curl -X DELETE http://localhost:8080/motivation/1
 ```
 
 ### Go Module Management
@@ -109,6 +117,7 @@ CREATE INDEX idx_motivations_created_at ON motivations(created_at);
    - `GetRandom()` - Retrieves a random motivation
    - `Insert(text)` - Adds a new motivation
    - `GetAll()` - Lists all motivations
+   - `Delete(id)` - Removes a motivation by id
    - `Count()` - Returns total count
 4. **db/migrate_text.go** - One-time migration from motivations.txt
 
@@ -133,9 +142,8 @@ Environment variable:
 ## Future Enhancements
 
 Possible additions:
-- GET /motivations - List all motivations with pagination
+- Pagination for GET /motivations
 - PUT /motivation/:id - Update a specific motivation
-- DELETE /motivation/:id - Remove a motivation
 - Search and filtering capabilities
 - Categories and tags
 - User voting/favorites system
