@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -13,7 +14,9 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -602,7 +605,8 @@ func runCheckAgainst(t *testing.T, handler http.Handler, build func() Check) err
 }
 
 func TestCheckLandingPage_PassesWhenAllSnippetsPresent(t *testing.T) {
-	body := "Welcome to the Random Motivation API\nGET /motivation\nPOST /motivation\nGET /motivations.png\n"
+	body := "Welcome to the Random Motivation API\nGET /motivation\nPOST /motivation\n" +
+		"GET /motivations\nDELETE /motivation/:id\nGET /motivations.png\n"
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
@@ -642,8 +646,11 @@ func TestCheckLandingPage_FailsWhenStatusNotOK(t *testing.T) {
 }
 
 func TestCheckLandingPage_FailsWhenMissingSnippet(t *testing.T) {
-	// Missing "GET /motivations.png".
-	body := "Welcome to the Random Motivation API\nGET /motivation\nPOST /motivation\n"
+	// Missing "GET /motivations.png" only; the other new snippets
+	// ("GET /motivations", "DELETE /motivation/:id") are present so this
+	// still isolates the final-snippet failure path.
+	body := "Welcome to the Random Motivation API\nGET /motivation\nPOST /motivation\n" +
+		"GET /motivations\nDELETE /motivation/:id\n"
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, body)
@@ -1956,6 +1963,8 @@ func TestBuildExistingServiceSuite_ContainsExpectedChecksInOrder(t *testing.T) {
 		"whitespace motivation POST is rejected",
 		"unsupported methods are rejected with 405",
 		"unknown route returns 404",
+		"DELETE unknown motivation id returns 404",
+		"DELETE unparseable motivation id returns 400",
 		"submitted motivation is eventually retrievable (existing service)",
 	}
 	gotOrder := checkNames(suite)
@@ -1984,8 +1993,8 @@ func TestBuildExistingServiceSuite_ContainsExpectedChecksInOrder(t *testing.T) {
 
 func TestSelfManagedGroups_OrderingConstraints(t *testing.T) {
 	groups := buildSelfManagedGroups()
-	if len(groups) != 7 {
-		t.Fatalf("expected 7 groups, got %d", len(groups))
+	if len(groups) != 10 {
+		t.Fatalf("expected 10 groups, got %d", len(groups))
 	}
 
 	// Group A
@@ -1998,6 +2007,7 @@ func TestSelfManagedGroups_OrderingConstraints(t *testing.T) {
 		"unknown route returns 404",
 		"empty motivation collection returns 404",
 		"empty motivation collection PNG returns 404",
+		"empty motivations list returns empty JSON array",
 		"submitted motivation is trimmed before storage",
 	}
 	gotA := checkNames(a.checks)
@@ -2009,15 +2019,16 @@ func TestSelfManagedGroups_OrderingConstraints(t *testing.T) {
 			t.Errorf("group A position %d: got=%q want=%q", i, gotA[i], wantA[i])
 		}
 	}
-	// emptyCollection (T13) and pngNone (T19) must precede the
-	// trimmed-submission check (T15), which is the only state-
-	// mutating POST in group A.
+	// emptyCollection (T13), pngNone (T19), and the empty-list check
+	// (T22) must precede the trimmed-submission check (T15), which is
+	// the only state-mutating POST in group A.
 	idxEmpty := indexOfName(gotA, "empty motivation collection returns 404")
 	idxPNGNone := indexOfName(gotA, "empty motivation collection PNG returns 404")
+	idxListEmpty := indexOfName(gotA, "empty motivations list returns empty JSON array")
 	idxTrimmed := indexOfName(gotA, "submitted motivation is trimmed before storage")
-	if !(idxEmpty < idxTrimmed && idxPNGNone < idxTrimmed) {
-		t.Errorf("group A: empty/pngNone must precede trimmed POST; idxEmpty=%d idxPNGNone=%d idxTrimmed=%d",
-			idxEmpty, idxPNGNone, idxTrimmed)
+	if !(idxEmpty < idxTrimmed && idxPNGNone < idxTrimmed && idxListEmpty < idxTrimmed) {
+		t.Errorf("group A: empty/pngNone/listEmpty must precede trimmed POST; idxEmpty=%d idxPNGNone=%d idxListEmpty=%d idxTrimmed=%d",
+			idxEmpty, idxPNGNone, idxListEmpty, idxTrimmed)
 	}
 
 	// Group B: T14-isolated alone (single-entry state).
@@ -2027,42 +2038,64 @@ func TestSelfManagedGroups_OrderingConstraints(t *testing.T) {
 		t.Errorf("group B: got=%v want=%v", got, wantB)
 	}
 
-	// Group C: T10 + T18 share a DB (neither asserts solo state).
+	// Group C: T23 needs solo state (asserts its own POST is the only
+	// list entry).
 	c := groups[2]
-	wantC := []string{
-		"valid motivation POST is accepted",
-		"PNG render success",
-	}
+	wantC := []string{"motivations list reflects a single POST (isolated)"}
 	if got := checkNames(c.checks); !equalStrings(got, wantC) {
 		t.Errorf("group C: got=%v want=%v", got, wantC)
 	}
 
-	// Group D: T16 needs solo state.
+	// Group D: T10 + T18 share a DB (neither asserts solo state).
 	d := groups[3]
-	wantD := []string{"multiple submitted motivations are retrievable (isolated)"}
+	wantD := []string{
+		"valid motivation POST is accepted",
+		"PNG render success",
+	}
 	if got := checkNames(d.checks); !equalStrings(got, wantD) {
 		t.Errorf("group D: got=%v want=%v", got, wantD)
 	}
 
-	// Group E: T17 needs solo state.
+	// Group E: T16 needs solo state.
 	e := groups[4]
-	wantE := []string{"repeated GET /motivation remains available (isolated)"}
+	wantE := []string{"multiple submitted motivations are retrievable (isolated)"}
 	if got := checkNames(e.checks); !equalStrings(got, wantE) {
 		t.Errorf("group E: got=%v want=%v", got, wantE)
 	}
 
-	// Group F: render unreachable.
+	// Group F: T17 needs solo state.
 	f := groups[5]
-	wantF := []string{"PNG render fails when render service is unreachable"}
+	wantF := []string{"repeated GET /motivation remains available (isolated)"}
 	if got := checkNames(f.checks); !equalStrings(got, wantF) {
 		t.Errorf("group F: got=%v want=%v", got, wantF)
 	}
 
-	// Group G: render non-OK.
+	// Group G: T26 needs solo state (asserts exactly two entries, then one).
 	g := groups[6]
-	wantG := []string{"PNG render fails when render service returns non-OK"}
+	wantG := []string{"DELETE removes a motivation from the list (isolated)"}
 	if got := checkNames(g.checks); !equalStrings(got, wantG) {
 		t.Errorf("group G: got=%v want=%v", got, wantG)
+	}
+
+	// Group H: T27 needs solo state (regression test for queue eviction).
+	h := groups[7]
+	wantH := []string{"deleted motivation stops being served by GET /motivation (isolated)"}
+	if got := checkNames(h.checks); !equalStrings(got, wantH) {
+		t.Errorf("group H: got=%v want=%v", got, wantH)
+	}
+
+	// Group I: render unreachable.
+	i := groups[8]
+	wantI := []string{"PNG render fails when render service is unreachable"}
+	if got := checkNames(i.checks); !equalStrings(got, wantI) {
+		t.Errorf("group I: got=%v want=%v", got, wantI)
+	}
+
+	// Group J: render non-OK.
+	j := groups[9]
+	wantJ := []string{"PNG render fails when render service returns non-OK"}
+	if got := checkNames(j.checks); !equalStrings(got, wantJ) {
+		t.Errorf("group J: got=%v want=%v", got, wantJ)
 	}
 }
 
@@ -2208,5 +2241,746 @@ func TestNewFailingRender(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Errorf("expected status 500, got %d", resp.StatusCode)
+	}
+}
+
+// --- decodeMotivationList ---
+
+func TestDecodeMotivationList_ParsesArray(t *testing.T) {
+	items, err := decodeMotivationList([]byte(`[{"id":1,"text":"a","created_at":"2020-01-01"},{"id":2,"text":"b","created_at":"2020-01-02"}]`))
+	if err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+	if items[0].ID != 1 || items[0].Text != "a" || items[0].CreatedAt != "2020-01-01" {
+		t.Errorf("unexpected item[0]: %+v", items[0])
+	}
+}
+
+func TestDecodeMotivationList_ParsesEmptyArray(t *testing.T) {
+	items, err := decodeMotivationList([]byte(`[]`))
+	if err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if len(items) != 0 {
+		t.Errorf("expected 0 items, got %d", len(items))
+	}
+}
+
+func TestDecodeMotivationList_ErrorsOnMalformedJSON(t *testing.T) {
+	_, err := decodeMotivationList([]byte(`not json`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+// --- checkMotivationsListEmpty (T22) ---
+
+func TestCheckMotivationsListEmpty_PassesOn200EmptyArray(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/motivations" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "[]")
+	})
+	if err := runCheckAgainst(t, h, checkMotivationsListEmpty); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestCheckMotivationsListEmpty_TaggedDestructive(t *testing.T) {
+	c := checkMotivationsListEmpty()
+	if c.Kind&destructive == 0 {
+		t.Errorf("motivations list empty check should be tagged destructive, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckMotivationsListEmpty_FailsWhenStatusNot200(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "[]")
+	})
+	err := runCheckAgainst(t, h, checkMotivationsListEmpty)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "500") {
+		t.Errorf("expected status detail, got: %s", err)
+	}
+}
+
+func TestCheckMotivationsListEmpty_FailsWhenBodyIsNull(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "null")
+	})
+	err := runCheckAgainst(t, h, checkMotivationsListEmpty)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "null") {
+		t.Errorf("expected error to mention null body, got: %s", err)
+	}
+}
+
+func TestCheckMotivationsListEmpty_FailsWhenArrayNonEmpty(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `[{"id":1,"text":"leftover","created_at":"2020-01-01"}]`)
+	})
+	err := runCheckAgainst(t, h, checkMotivationsListEmpty)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "1 entries") {
+		t.Errorf("expected entry count detail, got: %s", err)
+	}
+}
+
+func TestCheckMotivationsListEmpty_FailsOnMalformedBody(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "not json")
+	})
+	err := runCheckAgainst(t, h, checkMotivationsListEmpty)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+// --- checkMotivationsListAfterPost (T23) ---
+
+func TestCheckMotivationsListAfterPost_PassesWithSingleMatchingEntry(t *testing.T) {
+	var stashed string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			stashed = string(b)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `[{"id":42,"text":%q,"created_at":"2024-01-01T00:00:00Z"}]`, stashed)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-list-after-post"
+	c := checkMotivationsListAfterPost()
+	if err := c.Run(context.Background(), env); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	want := "uat-list-after-post-" + env.RunID
+	if stashed != want {
+		t.Errorf("emulated app stashed %q, want %q", stashed, want)
+	}
+}
+
+func TestCheckMotivationsListAfterPost_TaggedDestructive(t *testing.T) {
+	c := checkMotivationsListAfterPost()
+	if c.Kind&destructive == 0 {
+		t.Errorf("list-after-post check should be tagged destructive, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckMotivationsListAfterPost_FailsWhenEntryCountWrong(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "[]")
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkMotivationsListAfterPost)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "exactly 1 entry") {
+		t.Errorf("expected entry-count detail, got: %s", err)
+	}
+}
+
+func TestCheckMotivationsListAfterPost_FailsWhenTextMismatch(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `[{"id":1,"text":"wrong text","created_at":"2024-01-01"}]`)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkMotivationsListAfterPost)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "wrong text") {
+		t.Errorf("expected text mismatch detail, got: %s", err)
+	}
+}
+
+func TestCheckMotivationsListAfterPost_FailsWhenIDNotPositive(t *testing.T) {
+	var stashed string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			stashed = string(b)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `[{"id":0,"text":%q,"created_at":"2024-01-01"}]`, stashed)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkMotivationsListAfterPost)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "positive integer") {
+		t.Errorf("expected id detail, got: %s", err)
+	}
+}
+
+func TestCheckMotivationsListAfterPost_FailsWhenCreatedAtEmpty(t *testing.T) {
+	var stashed string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			stashed = string(b)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `[{"id":7,"text":%q,"created_at":""}]`, stashed)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkMotivationsListAfterPost)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "created_at") {
+		t.Errorf("expected created_at detail, got: %s", err)
+	}
+}
+
+// --- checkDeleteUnknownID (T24) ---
+
+func TestCheckDeleteUnknownID_PassesWhen404AndExpectedBody(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/motivation/9223372036854775807" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, "Motivation not found")
+	})
+	if err := runCheckAgainst(t, h, checkDeleteUnknownID); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestCheckDeleteUnknownID_TaggedNonDestructive(t *testing.T) {
+	c := checkDeleteUnknownID()
+	if c.Kind&nonDestructive == 0 || c.Kind&destructive != 0 {
+		t.Errorf("delete-unknown-id check should be tagged nonDestructive only, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckDeleteUnknownID_FailsOnWrongStatus(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	err := runCheckAgainst(t, h, checkDeleteUnknownID)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("expected status detail, got: %s", err)
+	}
+}
+
+func TestCheckDeleteUnknownID_FailsOnWrongBody(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, "nope")
+	})
+	err := runCheckAgainst(t, h, checkDeleteUnknownID)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "Motivation not found") {
+		t.Errorf("expected body detail, got: %s", err)
+	}
+}
+
+// --- checkDeleteInvalidID (T25) ---
+
+func TestCheckDeleteInvalidID_PassesWhenAllVariantsReturn400(t *testing.T) {
+	var seenPaths []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPaths = append(seenPaths, r.URL.Path)
+		if r.Method != http.MethodDelete {
+			t.Errorf("unexpected method: %s", r.Method)
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "Invalid motivation id")
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-invalid-id"
+	c := checkDeleteInvalidID()
+	if err := c.Run(context.Background(), env); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if len(seenPaths) < 3 {
+		t.Errorf("expected at least 3 variants exercised, got %d: %v", len(seenPaths), seenPaths)
+	}
+	joined := strings.Join(seenPaths, " ")
+	for _, want := range []string{"not-a-number", "1.5", env.RunID} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("expected one of the exercised paths to contain %q, got %v", want, seenPaths)
+		}
+	}
+}
+
+func TestCheckDeleteInvalidID_TaggedNonDestructive(t *testing.T) {
+	c := checkDeleteInvalidID()
+	if c.Kind&nonDestructive == 0 || c.Kind&destructive != 0 {
+		t.Errorf("delete-invalid-id check should be tagged nonDestructive only, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckDeleteInvalidID_FailsOnWrongStatusForOneVariant(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "1.5") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "Invalid motivation id")
+	})
+	err := runCheckAgainst(t, h, checkDeleteInvalidID)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "1.5") {
+		t.Errorf("expected error to identify offending id, got: %s", err)
+	}
+}
+
+func TestCheckDeleteInvalidID_FailsOnWrongBody(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "nope")
+	})
+	err := runCheckAgainst(t, h, checkDeleteInvalidID)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "Invalid motivation id") {
+		t.Errorf("expected body detail, got: %s", err)
+	}
+}
+
+// --- checkDeleteRemovesFromList (T26) ---
+
+func TestCheckDeleteRemovesFromList_PassesWhenSecondSurvives(t *testing.T) {
+	type fakeEntry struct {
+		ID        int64  `json:"id"`
+		Text      string `json:"text"`
+		CreatedAt string `json:"created_at"`
+	}
+	var mu sync.Mutex
+	var items []fakeEntry
+	var nextID int64 = 1
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			items = append(items, fakeEntry{ID: nextID, Text: string(b), CreatedAt: "2024-01-01T00:00:00Z"})
+			nextID++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			buf, err := json.Marshal(items)
+			if err != nil {
+				t.Fatalf("marshal items: %v", err)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(buf)
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/motivation/"):
+			idStr := strings.TrimPrefix(r.URL.Path, "/motivation/")
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, "Invalid motivation id")
+				return
+			}
+			found := -1
+			for i, it := range items {
+				if it.ID == id {
+					found = i
+					break
+				}
+			}
+			if found == -1 {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, "Motivation not found")
+				return
+			}
+			items = append(items[:found], items[found+1:]...)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-delrmlist"
+	c := checkDeleteRemovesFromList()
+	if err := c.Run(context.Background(), env); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestCheckDeleteRemovesFromList_TaggedDestructive(t *testing.T) {
+	c := checkDeleteRemovesFromList()
+	if c.Kind&destructive == 0 {
+		t.Errorf("delete-removes-from-list check should be tagged destructive, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckDeleteRemovesFromList_FailsWhenInitialListCountWrong(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "[]")
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkDeleteRemovesFromList)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "2 entries before delete") {
+		t.Errorf("expected entry-count detail, got: %s", err)
+	}
+}
+
+func TestCheckDeleteRemovesFromList_FailsWhenDeleteStatusWrong(t *testing.T) {
+	var texts []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			texts = append(texts, string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `[{"id":11,"text":%q,"created_at":"2024-01-01"},{"id":22,"text":%q,"created_at":"2024-01-01"}]`, texts[0], texts[1])
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkDeleteRemovesFromList)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "204") {
+		t.Errorf("expected status detail, got: %s", err)
+	}
+}
+
+func TestCheckDeleteRemovesFromList_FailsWhenFinalListCountWrong(t *testing.T) {
+	var texts []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			texts = append(texts, string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			// Always returns both entries, simulating a delete that
+			// didn't take effect.
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `[{"id":11,"text":%q,"created_at":"2024-01-01"},{"id":22,"text":%q,"created_at":"2024-01-01"}]`, texts[0], texts[1])
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkDeleteRemovesFromList)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "1 entry after delete") {
+		t.Errorf("expected final-count detail, got: %s", err)
+	}
+}
+
+func TestCheckDeleteRemovesFromList_FailsWhenSurvivorTextWrong(t *testing.T) {
+	var texts []string
+	var getCalls int
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			texts = append(texts, string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			getCalls++
+			w.WriteHeader(http.StatusOK)
+			if getCalls == 1 {
+				fmt.Fprintf(w, `[{"id":11,"text":%q,"created_at":"2024-01-01"},{"id":22,"text":%q,"created_at":"2024-01-01"}]`, texts[0], texts[1])
+				return
+			}
+			// After delete, return a single entry with unexpected text.
+			_, _ = io.WriteString(w, `[{"id":22,"text":"corrupted","created_at":"2024-01-01"}]`)
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkDeleteRemovesFromList)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "remaining entry text") {
+		t.Errorf("expected survivor-text detail, got: %s", err)
+	}
+}
+
+// --- checkDeletedMotivationNotServed (T27) ---
+
+func TestCheckDeletedMotivationNotServed_PassesWhenDeletedNeverServedAndSurvivorSeen(t *testing.T) {
+	type qEntry struct {
+		id   int64
+		text string
+	}
+	var mu sync.Mutex
+	var queue []qEntry
+	var nextID int64 = 1
+	pos := 0
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			queue = append(queue, qEntry{id: nextID, text: string(b)})
+			nextID++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			var sb strings.Builder
+			sb.WriteString("[")
+			for i, e := range queue {
+				if i > 0 {
+					sb.WriteString(",")
+				}
+				fmt.Fprintf(&sb, `{"id":%d,"text":%q,"created_at":"2024-01-01"}`, e.id, e.text)
+			}
+			sb.WriteString("]")
+			_, _ = io.WriteString(w, sb.String())
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/motivation/"):
+			idStr := strings.TrimPrefix(r.URL.Path, "/motivation/")
+			id, _ := strconv.ParseInt(idStr, 10, 64)
+			idx := -1
+			for i, e := range queue {
+				if e.id == id {
+					idx = i
+					break
+				}
+			}
+			if idx == -1 {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, "Motivation not found")
+				return
+			}
+			queue = append(queue[:idx], queue[idx+1:]...)
+			if len(queue) == 0 {
+				pos = 0
+			} else {
+				pos %= len(queue)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			if len(queue) == 0 {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, "No motivations found")
+				return
+			}
+			e := queue[pos]
+			pos = (pos + 1) % len(queue)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, e.text)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	env := newTestEnv(srv.URL, &bytes.Buffer{}, false)
+	env.RunID = "test-run-notserved"
+	c := checkDeletedMotivationNotServed()
+	if err := c.Run(context.Background(), env); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestCheckDeletedMotivationNotServed_TaggedDestructive(t *testing.T) {
+	c := checkDeletedMotivationNotServed()
+	if c.Kind&destructive == 0 {
+		t.Errorf("deleted-not-served check should be tagged destructive, got kind=%d", c.Kind)
+	}
+}
+
+func TestCheckDeletedMotivationNotServed_FailsWhenVictimNotFoundInList(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "[]")
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkDeletedMotivationNotServed)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "could not locate victim") {
+		t.Errorf("expected locate-victim detail, got: %s", err)
+	}
+}
+
+func TestCheckDeletedMotivationNotServed_FailsWhenDeletedTextStillServed(t *testing.T) {
+	var texts []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			texts = append(texts, string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `[{"id":1,"text":%q,"created_at":"2024-01-01"},{"id":2,"text":%q,"created_at":"2024-01-01"}]`, texts[0], texts[1])
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			// Regression: keeps serving the deleted (victim) text.
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, texts[0])
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkDeletedMotivationNotServed)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "eviction from rotation regressed") {
+		t.Errorf("expected regression detail, got: %s", err)
+	}
+}
+
+func TestCheckDeletedMotivationNotServed_FailsWhenSurvivorNeverServed(t *testing.T) {
+	var texts []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			texts = append(texts, string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `[{"id":1,"text":%q,"created_at":"2024-01-01"},{"id":2,"text":%q,"created_at":"2024-01-01"}]`, texts[0], texts[1])
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, "No motivations found")
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkDeletedMotivationNotServed)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("expected status detail from GET /motivation, got: %s", err)
+	}
+}
+
+func TestCheckDeletedMotivationNotServed_FailsOnUnexpectedBody(t *testing.T) {
+	var texts []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/motivation":
+			b, _ := io.ReadAll(r.Body)
+			texts = append(texts, string(b))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "Motivation added successfully")
+		case r.Method == http.MethodGet && r.URL.Path == "/motivations":
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `[{"id":1,"text":%q,"created_at":"2024-01-01"},{"id":2,"text":%q,"created_at":"2024-01-01"}]`, texts[0], texts[1])
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/motivation":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "rogue text")
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	err := runCheckAgainst(t, h, checkDeletedMotivationNotServed)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "rogue text") {
+		t.Errorf("expected unexpected-body detail, got: %s", err)
 	}
 }
